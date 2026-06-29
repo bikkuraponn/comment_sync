@@ -32,7 +32,6 @@ jobs:
         env:
           API_KEY_FOR_ALL_COMMENT_GET:  ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET }}
           API_KEY_FOR_ALL_COMMENT_GET2: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET2 }}
-          API_KEY_FOR_ALL_COMMENT_GET3: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET3 }}
           VIDEO_ID:         ${{ vars.VIDEO_ID }}
           TURSO_URL:        ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}

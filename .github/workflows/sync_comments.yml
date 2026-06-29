@@ -7,7 +7,6 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    environment: YAJU-toolbox-record
     steps:
       - uses: actions/checkout@v4
 

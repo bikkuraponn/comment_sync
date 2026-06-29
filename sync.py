@@ -25,7 +25,6 @@ dotenv.load_dotenv()
 from turso_client import TursoClient
 
 VIDEO_ID = os.getenv("VIDEO_ID", "niKAylKNIEI")
-SPAM_TEXT = "屋上焼いてて草"
 BATCH_SIZE = 300
 DELETION_WINDOW_HOURS = 6
 DELETION_INTERVAL_MIN = 10
@@ -106,7 +105,7 @@ _UPSERT_SQL = """
     INSERT INTO comments
       (comment_id, parent_id, reply_order, thread_published_at,
        author_channel_id, handle, text, original_text, published_at,
-       like_count, is_spam, is_deleted, deleted_confirmed_at, fetched_at)
+       like_count, is_pinned, is_deleted, deleted_confirmed_at, fetched_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(comment_id) DO UPDATE SET
       original_text = CASE
@@ -119,7 +118,7 @@ _UPSERT_SQL = """
       END,
       text       = CASE WHEN is_deleted = 0 THEN excluded.text       ELSE text       END,
       like_count = CASE WHEN is_deleted = 0 THEN excluded.like_count ELSE like_count END,
-      is_spam    = CASE WHEN is_deleted = 0 THEN excluded.is_spam    ELSE is_spam    END,
+      is_pinned  = CASE WHEN is_deleted = 0 THEN excluded.is_pinned  ELSE is_pinned  END,
       fetched_at = excluded.fetched_at
 """
 
@@ -130,7 +129,7 @@ def _row_args(r: dict) -> list:
         r.get("thread_published_at"), r.get("author_channel_id"),
         r.get("handle"), r.get("text"), r.get("original_text"),
         r["published_at"], r.get("like_count"),
-        r["is_spam"], r["is_deleted"],
+        r["is_pinned"], r["is_deleted"],
         r.get("deleted_confirmed_at"), r["fetched_at"],
     ]
 
@@ -197,7 +196,7 @@ def fetch_all_replies(
                 "original_text": None,
                 "published_at": parse_epoch(rs["publishedAt"]),
                 "like_count": None if deleted else int(rs.get("likeCount", 0)),
-                "is_spam": 1 if SPAM_TEXT in (rs.get("textDisplay") or "") else 0,
+                "is_pinned": 0,
                 "is_deleted": 1 if deleted else 0,
                 "deleted_confirmed_at": now_epoch if deleted else None,
                 "fetched_at": now_epoch,
@@ -265,7 +264,7 @@ def sync_new_comments(client: TursoClient) -> int:
                 "original_text": None,
                 "published_at": pub,
                 "like_count": None if deleted else int(top_snip.get("likeCount", 0)),
-                "is_spam": 1 if SPAM_TEXT in (top_snip.get("textDisplay") or "") else 0,
+                "is_pinned": 1 if top_snip.get("isPinned") else 0,
                 "is_deleted": 1 if deleted else 0,
                 "deleted_confirmed_at": now_epoch if deleted else None,
                 "fetched_at": now_epoch,
@@ -286,7 +285,7 @@ def sync_new_comments(client: TursoClient) -> int:
                     "original_text": None,
                     "published_at": parse_epoch(rs["publishedAt"]),
                     "like_count": None if r_del else int(rs.get("likeCount", 0)),
-                    "is_spam": 1 if SPAM_TEXT in (rs.get("textDisplay") or "") else 0,
+                    "is_pinned": 0,
                     "is_deleted": 1 if r_del else 0,
                     "deleted_confirmed_at": now_epoch if r_del else None,
                     "fetched_at": now_epoch,
@@ -370,7 +369,7 @@ def sync_recent_replies(client: TursoClient) -> int:
                     "original_text": None,
                     "published_at": parse_epoch(rs["publishedAt"]),
                     "like_count": None if deleted else int(rs.get("likeCount", 0)),
-                    "is_spam": 1 if SPAM_TEXT in (rs.get("textDisplay") or "") else 0,
+                    "is_pinned": 0,
                     "is_deleted": 1 if deleted else 0,
                     "deleted_confirmed_at": now_epoch if deleted else None,
                     "fetched_at": now_epoch,

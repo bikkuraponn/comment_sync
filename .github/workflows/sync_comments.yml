@@ -1,0 +1,39 @@
+name: Sync Comments
+
+on:
+  repository_dispatch:
+    types: [sync-comments]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: YAJU-toolbox-record
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify secret
+        env:
+          CRONJOB_SECRET: ${{ secrets.CRONJOB_SECRET }}
+        run: |
+          if [[ "${{ github.event.client_payload.secret }}" != "$CRONJOB_SECRET" ]]; then
+            echo "Invalid secret"
+            exit 1
+          fi
+
+      - name: Run sync
+        env:
+          API_KEY_FOR_ALL_COMMENT_GET:  ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET }}
+          API_KEY_FOR_ALL_COMMENT_GET2: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET2 }}
+          API_KEY_FOR_ALL_COMMENT_GET3: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET3 }}
+          VIDEO_ID:         ${{ vars.VIDEO_ID }}
+          TURSO_URL:        ${{ secrets.TURSO_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python sync.py

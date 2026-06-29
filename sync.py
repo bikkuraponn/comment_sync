@@ -2,7 +2,7 @@
 毎分差分同期 + 毎10分削除検知。GitHub Actions から呼び出す。
 
 環境変数:
-  API_KEY_FOR_ALL_COMMENT_GET, API_KEY_FOR_ALL_COMMENT_GET2, API_KEY_FOR_ALL_COMMENT_GET3
+  API_KEY_FOR_ALL_COMMENT_GET, API_KEY_FOR_ALL_COMMENT_GET2
   VIDEO_ID
   TURSO_URL
   TURSO_AUTH_TOKEN
@@ -38,7 +38,6 @@ REPLY_SYNC_INTERVAL_MIN = 10
 _API_KEYS = [k for k in [
     os.getenv("API_KEY_FOR_ALL_COMMENT_GET"),
     os.getenv("API_KEY_FOR_ALL_COMMENT_GET2"),
-    os.getenv("API_KEY_FOR_ALL_COMMENT_GET3"),
 ] if k]
 _key_idx = 0
 _exhausted_count = 0

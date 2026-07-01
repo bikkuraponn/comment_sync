@@ -26,10 +26,10 @@ from turso_client import TursoClient
 
 VIDEO_ID = os.getenv("VIDEO_ID", "niKAylKNIEI")
 BATCH_SIZE = 300
-DELETION_WINDOW_HOURS = 6
+DELETION_WINDOW_HOURS = 3
 DELETION_INTERVAL_MIN = 10
 REPLY_SYNC_WINDOW_HOURS = 3
-REPLY_SYNC_INTERVAL_MIN = 10
+REPLY_SYNC_INTERVAL_MIN = 30
 
 # ------------------------------------------------------------------ #
 # API キーローテーション（ダッシュボード用 YOUTUBE_API_KEY は使わない）

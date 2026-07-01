@@ -481,10 +481,6 @@ def main():
     n_new = sync_new_comments(client)
     print(f"  新着: {n_new} 件")
 
-    if now.minute % REPLY_SYNC_INTERVAL_MIN == 0:
-        n_rep = sync_recent_replies(client)
-        print(f"  返信再同期: {n_rep} 件（直近{REPLY_SYNC_WINDOW_HOURS}h）")
-
     if now.minute % DELETION_INTERVAL_MIN == 0:
         n_del = detect_deletions(client)
         print(f"  削除検知: {n_del} 件")

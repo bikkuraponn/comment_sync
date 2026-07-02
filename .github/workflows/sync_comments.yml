@@ -4,9 +4,14 @@ on:
   repository_dispatch:
     types: [sync-comments]
 
+concurrency:
+  group: sync-comments
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 

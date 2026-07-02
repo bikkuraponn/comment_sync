@@ -92,12 +92,15 @@ def is_deleted_sentinel(snippet: dict) -> bool:
     return handle == "" or str(snippet.get("likeCount", "")).upper() == "DELETED"
 
 
-def get_latest_thread_id(client: TursoClient) -> str | None:
+def get_latest_thread_pub(client: TursoClient) -> int | None:
+    # idx_parent_published により1行読み取りで済む。
+    # スレッドIDではなく published_at を停止条件にする:
+    # 最新スレッドが YouTube 上で削除されると ID は二度と API 応答に
+    # 現れず、全履歴をページングし続けてクォータを焼き尽くすため。
     rows = client.query(
-        "SELECT comment_id FROM comments "
-        "WHERE parent_id IS NULL ORDER BY published_at DESC LIMIT 1"
+        "SELECT MAX(published_at) AS p FROM comments WHERE parent_id IS NULL"
     )
-    return rows[0]["comment_id"] if rows else None
+    return rows[0]["p"] if rows and rows[0]["p"] is not None else None
 
 
 _UPSERT_SQL = """
@@ -214,14 +217,19 @@ def fetch_all_replies(
 # 新着同期（毎分）
 # ------------------------------------------------------------------ #
 
+MAX_PAGES = 30  # 安全弁: 毎分実行で30ページ(3000スレッド)を超える新着はあり得ない
+
+
 def sync_new_comments(client: TursoClient) -> int:
-    stop_id = get_latest_thread_id(client)
+    stop_pub = get_latest_thread_pub(client)
     now_epoch = int(datetime.now(timezone.utc).timestamp())
     youtube = get_youtube()
     next_page_token = None
     pending: list[dict] = []
     inserted = 0
     found_stop = False
+    found_in_window = False  # 固定コメント(2024年投稿)が先頭に来る対策
+    pages = 0
 
     while True:
         try:
@@ -241,13 +249,22 @@ def sync_new_comments(client: TursoClient) -> int:
                 continue
             raise
 
+        pages += 1
+
         for item in resp.get("items", []):
             top_snip = item["snippet"]["topLevelComment"]["snippet"]
             tid = item["snippet"]["topLevelComment"]["id"]
             pub = parse_epoch(top_snip["publishedAt"])
 
-            if tid == stop_id:
-                found_stop = True
+            if stop_pub is not None and pub < stop_pub:
+                if found_in_window or pages > 1:
+                    found_stop = True
+                else:
+                    # 1ページ目でまだ新着を1件も見ていない → 固定コメント
+                    print(f"  固定コメントとみなしてスキップ: {tid} (pub={top_snip['publishedAt']})", flush=True)
+                    continue
+            else:
+                found_in_window = True
 
             deleted = is_deleted_sentinel(top_snip)
             thread_pub = pub
@@ -304,6 +321,10 @@ def sync_new_comments(client: TursoClient) -> int:
             pending = []
 
         if found_stop:
+            break
+
+        if pages >= MAX_PAGES:
+            print(f"  WARNING: {MAX_PAGES}ページに達したため打ち切り（停止条件に到達せず）", flush=True)
             break
 
         next_page_token = resp.get("nextPageToken")

@@ -256,9 +256,12 @@ def sync_new_comments(client: TursoClient) -> int:
             tid = item["snippet"]["topLevelComment"]["id"]
             pub = parse_epoch(top_snip["publishedAt"])
 
-            if stop_pub is not None and pub < stop_pub:
-                if found_in_window or pages > 1:
+            if stop_pub is not None and pub <= stop_pub:
+                if pub == stop_pub or found_in_window or pages > 1:
+                    # 既知の最新スレッド、またはそれより古いスレッドに到達
+                    # → 以降は既知データなので即座に打ち切り（再取得・再書込みしない）
                     found_stop = True
+                    break
                 else:
                     # 1ページ目でまだ新着を1件も見ていない → 固定コメント
                     print(f"  固定コメントとみなしてスキップ: {tid} (pub={top_snip['publishedAt']})", flush=True)
@@ -307,13 +310,12 @@ def sync_new_comments(client: TursoClient) -> int:
                     "fetched_at": now_epoch,
                 })
 
-            if not found_stop:
-                # 新着スレッドのみ: inline に収まらない返信を追加取得
-                extra = fetch_all_replies(
-                    youtube, tid, thread_pub, inline_replies,
-                    item["snippet"]["totalReplyCount"], now_epoch,
-                )
-                pending.extend(extra)
+            # ここに到達するのは新着スレッドのみ（既知に達したら上で break 済み）
+            extra = fetch_all_replies(
+                youtube, tid, thread_pub, inline_replies,
+                item["snippet"]["totalReplyCount"], now_epoch,
+            )
+            pending.extend(extra)
 
         if len(pending) >= BATCH_SIZE:
             upsert_rows(client, pending)
@@ -501,6 +503,10 @@ def main():
 
     n_new = sync_new_comments(client)
     print(f"  新着: {n_new} 件")
+
+    if now.minute % REPLY_SYNC_INTERVAL_MIN == 0:
+        n_reply = sync_recent_replies(client)
+        print(f"  返信再同期: {n_reply} 件")
 
     if now.minute % DELETION_INTERVAL_MIN == 0:
         n_del = detect_deletions(client)

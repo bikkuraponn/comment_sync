@@ -26,8 +26,6 @@ from turso_client import TursoClient
 
 VIDEO_ID = os.getenv("VIDEO_ID", "niKAylKNIEI")
 BATCH_SIZE = 300
-DELETION_WINDOW_HOURS = 3
-DELETION_INTERVAL_MIN = 10
 REPLY_SYNC_WINDOW_HOURS = 3
 REPLY_SYNC_INTERVAL_MIN = 30
 
@@ -338,7 +336,38 @@ def sync_new_comments(client: TursoClient) -> int:
 
 
 # ------------------------------------------------------------------ #
-# 既存スレッドへの新規返信再同期（毎10分）
+# 削除マーキング共通処理
+# ------------------------------------------------------------------ #
+
+def _mark_deleted(client: TursoClient, comment_ids: list[str], now_epoch: int) -> int:
+    if not comment_ids:
+        return 0
+    stmts = [
+        {
+            "sql": """
+                UPDATE comments
+                SET is_deleted = 1,
+                    deleted_confirmed_at = ?,
+                    fetched_at = ?
+                WHERE comment_id = ?
+                  AND deleted_confirmed_at IS NULL
+            """,
+            "args": [now_epoch, now_epoch, cid],
+        }
+        for cid in comment_ids
+    ]
+    for i in range(0, len(stmts), BATCH_SIZE):
+        client.batch(stmts[i : i + BATCH_SIZE])
+    return len(comment_ids)
+
+
+# ------------------------------------------------------------------ #
+# 既存スレッドの返信再同期 + 削除検知（毎30分）
+#
+# 削除は「前回取得できていたスレッド/返信が、再取得したら消えている」
+# ことでしか判定できない（生のYouTube APIレスポンスに削除済みを示す
+# センチネル値は存在しない）。よってスレッド・返信それぞれについて
+# 既知IDと再取得結果のIDを突き合わせ、消えたものだけ削除扱いにする。
 # ------------------------------------------------------------------ #
 
 def sync_recent_replies(client: TursoClient) -> int:
@@ -356,13 +385,54 @@ def sync_recent_replies(client: TursoClient) -> int:
 
     youtube = get_youtube()
     total = 0
+    deleted_total = 0
 
+    # --- スレッド自身の生存確認 ---
+    thread_ids = [t["comment_id"] for t in threads]
+    alive_thread_ids: set[str] = set()
+    quota_exhausted = False
+
+    for i in range(0, len(thread_ids), 50):
+        chunk = thread_ids[i : i + 50]
+        while True:
+            try:
+                resp = youtube.comments().list(
+                    part="snippet",
+                    id=",".join(chunk),
+                    textFormat="plainText",
+                ).execute()
+                break
+            except HttpError as e:
+                if is_quota_error(e):
+                    if not rotate_key(e):
+                        quota_exhausted = True
+                        break
+                    youtube = get_youtube()
+                    continue
+                raise
+        if quota_exhausted:
+            break
+        for item in resp.get("items", []):
+            alive_thread_ids.add(item["id"])
+
+    if quota_exhausted:
+        print("  返信再同期をスキップ（クォータ枯渇）")
+        return 0
+
+    dead_thread_ids = [tid for tid in thread_ids if tid not in alive_thread_ids]
+    deleted_total += _mark_deleted(client, dead_thread_ids, now_epoch)
+    dead_thread_set = set(dead_thread_ids)
+
+    # --- 各スレッドの返信を再取得し、消えた返信を検知 ---
     for t in threads:
         tid = t["comment_id"]
+        if tid in dead_thread_set:
+            continue
         thread_pub = t["published_at"]
         next_page = None
         order = 1
         pending: list[dict] = []
+        fetched_ids: set[str] = set()
 
         while True:
             try:
@@ -383,22 +453,22 @@ def sync_recent_replies(client: TursoClient) -> int:
                 raise
 
             for r in resp.get("items", []):
+                fetched_ids.add(r["id"])
                 rs = r["snippet"]
-                deleted = is_deleted_sentinel(rs)
                 pending.append({
                     "comment_id": r["id"],
                     "parent_id": tid,
                     "reply_order": order,
                     "thread_published_at": thread_pub,
                     "author_channel_id": rs.get("authorChannelId", {}).get("value"),
-                    "handle": rs.get("authorDisplayName") if not deleted else None,
-                    "text": rs.get("textDisplay") if not deleted else None,
+                    "handle": rs.get("authorDisplayName"),
+                    "text": rs.get("textDisplay"),
                     "original_text": None,
                     "published_at": parse_epoch(rs["publishedAt"]),
-                    "like_count": None if deleted else int(rs.get("likeCount", 0)),
+                    "like_count": int(rs.get("likeCount", 0)),
                     "is_pinned": 0,
-                    "is_deleted": 1 if deleted else 0,
-                    "deleted_confirmed_at": now_epoch if deleted else None,
+                    "is_deleted": 0,
+                    "deleted_confirmed_at": None,
                     "fetched_at": now_epoch,
                 })
                 order += 1
@@ -410,73 +480,15 @@ def sync_recent_replies(client: TursoClient) -> int:
         upsert_rows(client, pending)
         total += len(pending)
 
+        known = client.query(
+            "SELECT comment_id FROM comments WHERE parent_id = ? AND is_deleted = 0",
+            [tid],
+        )
+        known_ids = {r["comment_id"] for r in known}
+        deleted_total += _mark_deleted(client, list(known_ids - fetched_ids), now_epoch)
+
+    print(f"  削除検知: {deleted_total} 件")
     return total
-
-
-# ------------------------------------------------------------------ #
-# 削除検知（毎10分）
-# ------------------------------------------------------------------ #
-
-def detect_deletions(client: TursoClient) -> int:
-    now_epoch = int(datetime.now(timezone.utc).timestamp())
-    cutoff = now_epoch - DELETION_WINDOW_HOURS * 3600
-
-    rows = client.query(
-        "SELECT comment_id FROM comments "
-        "WHERE published_at >= ? AND is_deleted = 0",
-        [cutoff],
-    )
-    comment_ids = [r["comment_id"] for r in rows]
-    if not comment_ids:
-        return 0
-
-    youtube = get_youtube()
-    alive_ids: set[str] = set()
-
-    for i in range(0, len(comment_ids), 50):
-        chunk = comment_ids[i : i + 50]
-        while True:
-            try:
-                resp = youtube.comments().list(
-                    part="snippet",
-                    id=",".join(chunk),
-                    textFormat="plainText",
-                ).execute()
-                break
-            except HttpError as e:
-                if is_quota_error(e):
-                    if not rotate_key(e):
-                        print("削除検知をスキップ（クォータ枯渇）")
-                        return 0
-                    youtube = get_youtube()
-                    continue
-                raise
-
-        for item in resp.get("items", []):
-            alive_ids.add(item["id"])
-
-    deleted_ids = [cid for cid in comment_ids if cid not in alive_ids]
-    if not deleted_ids:
-        return 0
-
-    stmts = [
-        {
-            "sql": """
-                UPDATE comments
-                SET is_deleted = 1,
-                    deleted_confirmed_at = ?,
-                    fetched_at = ?
-                WHERE comment_id = ?
-                  AND deleted_confirmed_at IS NULL
-            """,
-            "args": [now_epoch, now_epoch, cid],
-        }
-        for cid in deleted_ids
-    ]
-    for i in range(0, len(stmts), BATCH_SIZE):
-        client.batch(stmts[i : i + BATCH_SIZE])
-
-    return len(deleted_ids)
 
 
 # ------------------------------------------------------------------ #
@@ -507,10 +519,6 @@ def main():
     if now.minute % REPLY_SYNC_INTERVAL_MIN == 0:
         n_reply = sync_recent_replies(client)
         print(f"  返信再同期: {n_reply} 件")
-
-    if now.minute % DELETION_INTERVAL_MIN == 0:
-        n_del = detect_deletions(client)
-        print(f"  削除検知: {n_del} 件")
 
 
 if __name__ == "__main__":

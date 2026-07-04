@@ -423,6 +423,15 @@ def sync_recent_replies(client: TursoClient) -> int:
     deleted_total += _mark_deleted(client, dead_thread_ids, now_epoch)
     dead_thread_set = set(dead_thread_ids)
 
+    # スレッドが消えれば、そこにぶら下がる返信も一緒に消える
+    # → APIを叩かず、既知の返信IDをそのまま削除扱いにする
+    for tid in dead_thread_ids:
+        known = client.query(
+            "SELECT comment_id FROM comments WHERE parent_id = ? AND is_deleted = 0",
+            [tid],
+        )
+        deleted_total += _mark_deleted(client, [r["comment_id"] for r in known], now_epoch)
+
     # --- 各スレッドの返信を再取得し、消えた返信を検知 ---
     for t in threads:
         tid = t["comment_id"]

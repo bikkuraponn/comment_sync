@@ -9,6 +9,7 @@
   CRONJOB_SECRET   (GitHub Actions の secret 認証用)
 """
 
+import json
 import os
 import sys
 import time
@@ -501,6 +502,63 @@ def sync_recent_replies(client: TursoClient) -> int:
 
 
 # ------------------------------------------------------------------ #
+# 時間バケット更新（/comment-velocity の高コストな2日分スキャンを
+# 廃止するため、1時間ごとの確定値を comments_hourly に貯めておく）
+# ------------------------------------------------------------------ #
+
+_UPSERT_HOURLY_SQL = """
+    INSERT INTO comments_hourly (hour_start, comment_count, thread_count, reply_count, handles)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(hour_start) DO UPDATE SET
+      comment_count = excluded.comment_count,
+      thread_count  = excluded.thread_count,
+      reply_count   = excluded.reply_count,
+      handles       = excluded.handles
+"""
+
+
+def compute_hour_bucket(client: TursoClient, hour_start: int) -> dict:
+    hour_end = hour_start + 3600
+    rows = client.query(
+        "SELECT parent_id, handle FROM comments "
+        "WHERE is_deleted = 0 AND published_at >= ? AND published_at < ?",
+        [hour_start, hour_end],
+    )
+    thread_count = sum(1 for r in rows if r["parent_id"] is None)
+    handles: dict[str, int] = {}
+    for r in rows:
+        h = r["handle"]
+        if h:
+            handles[h] = handles.get(h, 0) + 1
+    return {
+        "comment_count": len(rows),
+        "thread_count": thread_count,
+        "reply_count": len(rows) - thread_count,
+        "handles": handles,
+    }
+
+
+def update_hourly_buckets(client: TursoClient, hours_back: int = 1) -> int:
+    """直近 hours_back 時間ぶんのバケットを再計算してUPSERTする。
+
+    「確定した過去は二度とスキャンしない」ための土台。1時間だけの再計算は
+    毎分実行しても数百行程度で軽い。10分おきに hours_back=6 で広めに
+    再計算し、削除検知・返信backfillの遅延を吸収する（daily_statsの
+    _REPROCESS_DAYS と同じ考え方）。
+    """
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    current_hour_start = (now_epoch // 3600) * 3600
+    for i in range(hours_back):
+        hour_start = current_hour_start - i * 3600
+        bucket = compute_hour_bucket(client, hour_start)
+        client.execute(_UPSERT_HOURLY_SQL, [
+            hour_start, bucket["comment_count"], bucket["thread_count"],
+            bucket["reply_count"], json.dumps(bucket["handles"], ensure_ascii=False),
+        ])
+    return hours_back
+
+
+# ------------------------------------------------------------------ #
 # エントリポイント
 # ------------------------------------------------------------------ #
 
@@ -528,6 +586,13 @@ def main():
     if now.minute % REPLY_SYNC_INTERVAL_MIN == 0:
         n_reply = sync_recent_replies(client)
         print(f"  返信再同期: {n_reply} 件")
+
+    # 毎分: 現在時間のバケットだけ再計算（軽い）
+    # 10分おき: 直近6時間ぶんを広めに再計算し、上記の返信backfill・削除検知の
+    # 遅延を吸収する（daily_statsの_REPROCESS_DAYSと同じ考え方）
+    hours_back = 6 if now.minute % 10 == 0 else 1
+    n_hourly = update_hourly_buckets(client, hours_back=hours_back)
+    print(f"  時間バケット更新: 直近{n_hourly}時間分")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,11 @@ class TursoClient:
         }
 
     def execute(self, sql: str, args: list | None = None) -> dict:
-        return self._pipeline([{"sql": sql, "args": args or []}])
+        result = self._pipeline([{"sql": sql, "args": args or []}])
+        for rs in result.get("results", []):
+            if rs.get("type") == "error":
+                raise RuntimeError(f"Turso error: {rs['error']['message']}")
+        return result
 
     def batch(self, statements: list[dict]) -> dict:
         return self._pipeline(statements)

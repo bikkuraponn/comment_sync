@@ -148,6 +148,65 @@ def upsert_rows(client: TursoClient, rows: list[dict]) -> None:
         client.batch(stmts)
 
 
+# ------------------------------------------------------------------ #
+# 著者プロフィール(表示名・アイコンURL)の副産物キャッシュ
+#
+# commentThreads.list / comments.list のレスポンスには authorProfileImageUrl
+# が含まれているが、comments テーブルにはこれまで書き込んでいなかった
+# (comments.handle 自体もリネームに追従しないスナップショットなので、
+# アイコンURL列を comments 側に足しても同じ問題を抱えるだけ)。
+# ここでは comments テーブルの書き込み経路(8箇所に分散)には一切触れず、
+# 毎分の同期で「たまたま取得できたsnippet」から著者情報だけを別テーブル
+# comment_authors に追記する。karotter_bot の週次ランキング更新が、ここで
+# 貯まった鮮度の高い情報を優先的に使い、無い/古いアカウントだけ
+# YouTube channels.list でバックストップ解決する(ranking_common.py 参照)。
+# ------------------------------------------------------------------ #
+
+_AUTHORS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS comment_authors (
+  channel_id TEXT PRIMARY KEY,
+  handle     TEXT,
+  avatar_url TEXT,
+  updated_at INTEGER NOT NULL
+)
+"""
+
+_UPSERT_AUTHOR_SQL = """
+INSERT INTO comment_authors (channel_id, handle, avatar_url, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(channel_id) DO UPDATE SET
+  handle     = excluded.handle,
+  avatar_url = excluded.avatar_url,
+  updated_at = excluded.updated_at
+"""
+
+
+def _note_author(sightings: dict, snippet: dict, now_epoch: int) -> None:
+    """snippetから著者情報を拾いsightingsに記録する(削除済み・channel_id欠如はスキップ)。"""
+    if is_deleted_sentinel(snippet):
+        return
+    cid = snippet.get("authorChannelId", {}).get("value")
+    if not cid:
+        return
+    sightings[cid] = {
+        "handle": snippet.get("authorDisplayName") or "",
+        "avatar_url": snippet.get("authorProfileImageUrl") or "",
+        "updated_at": now_epoch,
+    }
+
+
+def upsert_author_sightings(client: TursoClient, sightings: dict) -> None:
+    if not sightings:
+        return
+    client.execute(_AUTHORS_TABLE_SQL)
+    stmts = [
+        {"sql": _UPSERT_AUTHOR_SQL, "args": [cid, s["handle"], s["avatar_url"], s["updated_at"]]}
+        for cid, s in sightings.items()
+    ]
+    for i in range(0, len(stmts), BATCH_SIZE):
+        client.batch(stmts[i : i + BATCH_SIZE])
+
+
 def fetch_all_replies(
     youtube,
     thread_id: str,
@@ -155,6 +214,7 @@ def fetch_all_replies(
     included_replies: list,
     total_reply_count: int,
     now_epoch: int,
+    sightings: dict | None = None,
 ) -> list[dict]:
     if total_reply_count <= len(included_replies):
         return []
@@ -186,6 +246,8 @@ def fetch_all_replies(
                 continue
             rs = r["snippet"]
             deleted = is_deleted_sentinel(rs)
+            if sightings is not None:
+                _note_author(sightings, rs, now_epoch)
             rows.append({
                 "comment_id": r["id"],
                 "parent_id": thread_id,
@@ -225,6 +287,7 @@ def sync_new_comments(client: TursoClient) -> int:
     youtube = get_youtube()
     next_page_token = None
     pending: list[dict] = []
+    sightings: dict = {}
     inserted = 0
     found_stop = False
     found_in_window = False  # 固定コメント(2024年投稿)が先頭に来る対策
@@ -270,6 +333,7 @@ def sync_new_comments(client: TursoClient) -> int:
 
             deleted = is_deleted_sentinel(top_snip)
             thread_pub = pub
+            _note_author(sightings, top_snip, now_epoch)
 
             pending.append({
                 "comment_id": tid,
@@ -292,6 +356,7 @@ def sync_new_comments(client: TursoClient) -> int:
             for order, r in enumerate(inline_replies, 1):
                 rs = r["snippet"]
                 r_del = is_deleted_sentinel(rs)
+                _note_author(sightings, rs, now_epoch)
                 pending.append({
                     "comment_id": r["id"],
                     "parent_id": tid,
@@ -312,7 +377,7 @@ def sync_new_comments(client: TursoClient) -> int:
             # ここに到達するのは新着スレッドのみ（既知に達したら上で break 済み）
             extra = fetch_all_replies(
                 youtube, tid, thread_pub, inline_replies,
-                item["snippet"]["totalReplyCount"], now_epoch,
+                item["snippet"]["totalReplyCount"], now_epoch, sightings,
             )
             pending.extend(extra)
 
@@ -333,6 +398,7 @@ def sync_new_comments(client: TursoClient) -> int:
             break
 
     upsert_rows(client, pending)
+    upsert_author_sightings(client, sightings)
     return inserted + len(pending)
 
 
@@ -387,6 +453,7 @@ def sync_recent_replies(client: TursoClient) -> int:
     youtube = get_youtube()
     total = 0
     deleted_total = 0
+    sightings: dict = {}
 
     # --- スレッド自身の生存確認 ---
     thread_ids = [t["comment_id"] for t in threads]
@@ -415,8 +482,10 @@ def sync_recent_replies(client: TursoClient) -> int:
             break
         for item in resp.get("items", []):
             alive_thread_ids.add(item["id"])
+            _note_author(sightings, item["snippet"], now_epoch)
 
     if quota_exhausted:
+        upsert_author_sightings(client, sightings)
         print("  返信再同期をスキップ（クォータ枯渇）")
         return 0
 
@@ -457,6 +526,7 @@ def sync_recent_replies(client: TursoClient) -> int:
                 if is_quota_error(e):
                     if not rotate_key(e):
                         upsert_rows(client, pending)
+                        upsert_author_sightings(client, sightings)
                         return total + len(pending)
                     youtube = get_youtube()
                     continue
@@ -465,6 +535,7 @@ def sync_recent_replies(client: TursoClient) -> int:
             for r in resp.get("items", []):
                 fetched_ids.add(r["id"])
                 rs = r["snippet"]
+                _note_author(sightings, rs, now_epoch)
                 pending.append({
                     "comment_id": r["id"],
                     "parent_id": tid,
@@ -497,6 +568,7 @@ def sync_recent_replies(client: TursoClient) -> int:
         known_ids = {r["comment_id"] for r in known}
         deleted_total += _mark_deleted(client, list(known_ids - fetched_ids), now_epoch)
 
+    upsert_author_sightings(client, sightings)
     print(f"  削除検知: {deleted_total} 件")
     return total
 

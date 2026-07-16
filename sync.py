@@ -164,34 +164,56 @@ def upsert_rows(client: TursoClient, rows: list[dict]) -> None:
 
 _AUTHORS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS comment_authors (
-  channel_id TEXT PRIMARY KEY,
-  handle     TEXT,
-  avatar_url TEXT,
-  updated_at INTEGER NOT NULL
+  channel_id    TEXT PRIMARY KEY,
+  handle        TEXT,
+  avatar_url    TEXT,
+  updated_at    INTEGER NOT NULL,
+  first_seen_at INTEGER
 )
 """
 
 _UPSERT_AUTHOR_SQL = """
-INSERT INTO comment_authors (channel_id, handle, avatar_url, updated_at)
-VALUES (?, ?, ?, ?)
+INSERT INTO comment_authors (channel_id, handle, avatar_url, updated_at, first_seen_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(channel_id) DO UPDATE SET
-  handle     = excluded.handle,
-  avatar_url = excluded.avatar_url,
-  updated_at = excluded.updated_at
+  handle        = excluded.handle,
+  avatar_url    = excluded.avatar_url,
+  updated_at    = excluded.updated_at,
+  first_seen_at = CASE
+    WHEN comment_authors.first_seen_at IS NULL THEN excluded.first_seen_at
+    WHEN excluded.first_seen_at IS NULL THEN comment_authors.first_seen_at
+    WHEN excluded.first_seen_at < comment_authors.first_seen_at THEN excluded.first_seen_at
+    ELSE comment_authors.first_seen_at
+  END
 """
 
 
 def _note_author(sightings: dict, snippet: dict, now_epoch: int) -> None:
-    """snippetから著者情報を拾いsightingsに記録する(削除済み・channel_id欠如はスキップ)。"""
+    """snippetから著者情報を拾いsightingsに記録する(削除済み・channel_id欠如はスキップ)。
+
+    first_seen_at候補として、このsnippet自身のpublished_at(=このコメントの投稿時刻、
+    syncが動いたnow_epochではない)も記録する。同一著者を同じ実行内で複数回観測した
+    場合はここでMINを取って「このバッチで見えた中での最古」に絞り、Turso側のUPSERTでも
+    既存値とのMINを取る(comment_authors.first_seen_atのON CONFLICT参照)ため、
+    バックフィル済みの真の初コメント時刻を上書きすることはない。
+    """
     if is_deleted_sentinel(snippet):
         return
     cid = snippet.get("authorChannelId", {}).get("value")
     if not cid:
         return
+    published_at = parse_epoch(snippet["publishedAt"]) if snippet.get("publishedAt") else None
+    prev = sightings.get(cid)
+    prev_first_seen = prev.get("first_seen_at") if prev else None
+    if prev_first_seen is not None and (published_at is None or prev_first_seen < published_at):
+        first_seen_at = prev_first_seen
+    else:
+        first_seen_at = published_at
     sightings[cid] = {
         "handle": snippet.get("authorDisplayName") or "",
         "avatar_url": snippet.get("authorProfileImageUrl") or "",
         "updated_at": now_epoch,
+        "first_seen_at": first_seen_at,
     }
 
 
@@ -200,7 +222,8 @@ def upsert_author_sightings(client: TursoClient, sightings: dict) -> None:
         return
     client.execute(_AUTHORS_TABLE_SQL)
     stmts = [
-        {"sql": _UPSERT_AUTHOR_SQL, "args": [cid, s["handle"], s["avatar_url"], s["updated_at"]]}
+        {"sql": _UPSERT_AUTHOR_SQL,
+         "args": [cid, s["handle"], s["avatar_url"], s["updated_at"], s.get("first_seen_at")]}
         for cid, s in sightings.items()
     ]
     for i in range(0, len(stmts), BATCH_SIZE):

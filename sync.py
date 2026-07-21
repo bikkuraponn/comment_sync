@@ -452,13 +452,80 @@ def _mark_deleted(client: TursoClient, comment_ids: list[str], now_epoch: int) -
 
 
 # ------------------------------------------------------------------ #
-# 既存スレッドの返信再同期 + 削除検知（毎30分）
+# 既存スレッドの返信再同期 + 削除検知（毎30分 / スレッド巡回チェックの両方で共用）
 #
 # 削除は「前回取得できていたスレッド/返信が、再取得したら消えている」
 # ことでしか判定できない（生のYouTube APIレスポンスに削除済みを示す
 # センチネル値は存在しない）。よってスレッド・返信それぞれについて
 # 既知IDと再取得結果のIDを突き合わせ、消えたものだけ削除扱いにする。
 # ------------------------------------------------------------------ #
+
+def _resync_thread_replies(
+    youtube, client: TursoClient, tid: str, thread_pub: int, now_epoch: int, sightings: dict,
+) -> tuple[int, int, bool]:
+    """スレッド1件ぶんの返信を全件再取得し、消えた返信を削除扱いにする。
+
+    戻り値: (書き込んだ返信件数, 削除検知した件数, クォータ枯渇で中断したか)
+    """
+    next_page = None
+    order = 1
+    pending: list[dict] = []
+    fetched_ids: set[str] = set()
+
+    while True:
+        try:
+            resp = youtube.comments().list(
+                part="snippet",
+                parentId=tid,
+                maxResults=100,
+                pageToken=next_page,
+                textFormat="plainText",
+            ).execute()
+        except HttpError as e:
+            if is_quota_error(e):
+                if not rotate_key(e):
+                    upsert_rows(client, pending)
+                    return len(pending), 0, True
+                youtube = get_youtube()
+                continue
+            raise
+
+        for r in resp.get("items", []):
+            fetched_ids.add(r["id"])
+            rs = r["snippet"]
+            _note_author(sightings, rs, now_epoch)
+            pending.append({
+                "comment_id": r["id"],
+                "parent_id": tid,
+                "reply_order": order,
+                "thread_published_at": thread_pub,
+                "author_channel_id": rs.get("authorChannelId", {}).get("value"),
+                "handle": rs.get("authorDisplayName"),
+                "text": rs.get("textDisplay"),
+                "original_text": None,
+                "published_at": parse_epoch(rs["publishedAt"]),
+                "like_count": int(rs.get("likeCount", 0)),
+                "is_pinned": 0,
+                "is_deleted": 0,
+                "deleted_confirmed_at": None,
+                "fetched_at": now_epoch,
+            })
+            order += 1
+
+        next_page = resp.get("nextPageToken")
+        if not next_page:
+            break
+
+    upsert_rows(client, pending)
+
+    known = client.query(
+        "SELECT comment_id FROM comments WHERE parent_id = ? AND is_deleted = 0",
+        [tid],
+    )
+    known_ids = {r["comment_id"] for r in known}
+    deleted = _mark_deleted(client, list(known_ids - fetched_ids), now_epoch)
+    return len(pending), deleted, False
+
 
 def sync_recent_replies(client: TursoClient) -> int:
     now_epoch = int(datetime.now(timezone.utc).timestamp())
@@ -530,70 +597,227 @@ def sync_recent_replies(client: TursoClient) -> int:
         tid = t["comment_id"]
         if tid in dead_thread_set:
             continue
-        thread_pub = t["published_at"]
-        next_page = None
-        order = 1
-        pending: list[dict] = []
-        fetched_ids: set[str] = set()
-
-        while True:
-            try:
-                resp = youtube.comments().list(
-                    part="snippet",
-                    parentId=tid,
-                    maxResults=100,
-                    pageToken=next_page,
-                    textFormat="plainText",
-                ).execute()
-            except HttpError as e:
-                if is_quota_error(e):
-                    if not rotate_key(e):
-                        upsert_rows(client, pending)
-                        upsert_author_sightings(client, sightings)
-                        return total + len(pending)
-                    youtube = get_youtube()
-                    continue
-                raise
-
-            for r in resp.get("items", []):
-                fetched_ids.add(r["id"])
-                rs = r["snippet"]
-                _note_author(sightings, rs, now_epoch)
-                pending.append({
-                    "comment_id": r["id"],
-                    "parent_id": tid,
-                    "reply_order": order,
-                    "thread_published_at": thread_pub,
-                    "author_channel_id": rs.get("authorChannelId", {}).get("value"),
-                    "handle": rs.get("authorDisplayName"),
-                    "text": rs.get("textDisplay"),
-                    "original_text": None,
-                    "published_at": parse_epoch(rs["publishedAt"]),
-                    "like_count": int(rs.get("likeCount", 0)),
-                    "is_pinned": 0,
-                    "is_deleted": 0,
-                    "deleted_confirmed_at": None,
-                    "fetched_at": now_epoch,
-                })
-                order += 1
-
-            next_page = resp.get("nextPageToken")
-            if not next_page:
-                break
-
-        upsert_rows(client, pending)
-        total += len(pending)
-
-        known = client.query(
-            "SELECT comment_id FROM comments WHERE parent_id = ? AND is_deleted = 0",
-            [tid],
+        written, deleted, exhausted = _resync_thread_replies(
+            youtube, client, tid, t["published_at"], now_epoch, sightings,
         )
-        known_ids = {r["comment_id"] for r in known}
-        deleted_total += _mark_deleted(client, list(known_ids - fetched_ids), now_epoch)
+        total += written
+        deleted_total += deleted
+        if exhausted:
+            upsert_author_sightings(client, sightings)
+            return total
 
     upsert_author_sightings(client, sightings)
     print(f"  削除検知: {deleted_total} 件")
     return total
+
+
+# ------------------------------------------------------------------ #
+# スレッド巡回チェック（毎10分、全スレッドを少しずつ再訪問する）
+#
+# sync_recent_replies は直近 REPLY_SYNC_WINDOW_HOURS 時間のスレッドしか
+# 見ないため、それより古いスレッドに後から追加された返信は今までここでは
+# 一切検知されず、comments_db の refresh_replies_local.py (Pass1/Pass2) を
+# 人が手動実行するまで気づかれなかった。しかも refresh_replies_local.py 側も
+# 一度 threads_done に入ったスレッドは二度と再チェックしない設計なので、
+# 手動実行を繰り返しても「古いスレッドへの新着返信」は原理的に発見できない
+# (2026-07-21 の監査で判明)。
+#
+# ここでは commentThreads.list(id=50件) で totalReplyCount だけを安く
+# 確認し(50件=1 unit)、Turso 側の既知返信数(is_deleted=0のCOUNT)と
+# 食い違うスレッドだけ _resync_thread_replies で完全再取得する
+# (comments_db の Pass1/Pass2 と同じ二段構え)。この1回の呼び出しでは
+# 「スレッド自体が消えたか」も同じレスポンスから判定できるので、
+# sync_recent_replies のように別途 comments.list(id=...) で生存確認する
+# 必要はない。
+#
+# published_at 昇順でカーソルを進め、末尾まで行ったら先頭へ巻き戻して
+# 永久に一周し続ける(reply_recheck_state に1行だけ状態を持つ)。
+# デフォルト RECHECK_BATCH_SIZE=500 × 10分おき(1日144回)で
+# 1日あたり約72,000スレッドを確認でき、約144万スレッド全体を
+# 約20日で一周する計算。追加コストは1回あたり10 units前後
+# (500/50) + Pass2対象分のみ、1日あたり高々数千 units程度に収まる見込み
+# (API_KEY_FOR_ALL_COMMENT_GET/2 の合計クォータに対して余裕を持たせた
+# 保守的な初期値。頻度を上げたい場合はこの2定数を調整すること)。
+# ------------------------------------------------------------------ #
+
+RECHECK_BATCH_SIZE = 500
+RECHECK_INTERVAL_MIN = 10
+RECHECK_ID_CHUNK = 50    # commentThreads.list の id= に渡せる最大件数
+RECHECK_IN_CHUNK = 200   # Turso IN() 節のチャンクサイズ(ranking_updaterの_IN_CHUNKと同じ考え方)
+
+_RECHECK_STATE_SQL = """
+CREATE TABLE IF NOT EXISTS reply_recheck_state (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  cursor_published_at INTEGER NOT NULL,
+  cycle_count INTEGER NOT NULL,
+  cycle_started_at INTEGER NOT NULL,
+  threads_checked_in_cycle INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)
+"""
+
+
+def _read_recheck_state(client: TursoClient, now_epoch: int) -> dict:
+    client.execute(_RECHECK_STATE_SQL)
+    rows = client.query("SELECT * FROM reply_recheck_state WHERE id = 1")
+    if rows:
+        return rows[0]
+    return {
+        "cursor_published_at": 0,
+        "cycle_count": 0,
+        "cycle_started_at": now_epoch,
+        "threads_checked_in_cycle": 0,
+    }
+
+
+def _write_recheck_state(client: TursoClient, state: dict, now_epoch: int) -> None:
+    client.execute(
+        "INSERT INTO reply_recheck_state "
+        "(id, cursor_published_at, cycle_count, cycle_started_at, threads_checked_in_cycle, updated_at) "
+        "VALUES (1, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "cursor_published_at = excluded.cursor_published_at, "
+        "cycle_count = excluded.cycle_count, "
+        "cycle_started_at = excluded.cycle_started_at, "
+        "threads_checked_in_cycle = excluded.threads_checked_in_cycle, "
+        "updated_at = excluded.updated_at",
+        [state["cursor_published_at"], state["cycle_count"], state["cycle_started_at"],
+         state["threads_checked_in_cycle"], now_epoch],
+    )
+
+
+def _next_recheck_batch(client: TursoClient, cursor: int) -> tuple[list[dict], bool]:
+    """カーソルより新しいスレッドを古い順にBATCH_SIZE件取る。末尾に達したら先頭から巻き戻して補充する。"""
+    rows = client.query(
+        "SELECT comment_id, published_at FROM comments "
+        "WHERE parent_id IS NULL AND published_at > ? "
+        "ORDER BY published_at ASC LIMIT ?",
+        [cursor, RECHECK_BATCH_SIZE],
+    )
+    wrapped = False
+    if len(rows) < RECHECK_BATCH_SIZE:
+        wrapped = True
+        remaining = RECHECK_BATCH_SIZE - len(rows)
+        seen_ids = {r["comment_id"] for r in rows}
+        more = client.query(
+            "SELECT comment_id, published_at FROM comments "
+            "WHERE parent_id IS NULL AND published_at <= ? "
+            "ORDER BY published_at ASC LIMIT ?",
+            [cursor, remaining + len(seen_ids)],
+        )
+        for r in more:
+            if r["comment_id"] not in seen_ids:
+                rows.append(r)
+                if len(rows) >= RECHECK_BATCH_SIZE:
+                    break
+    return rows, wrapped
+
+
+def run_reply_recheck_batch(client: TursoClient) -> int:
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    state = _read_recheck_state(client, now_epoch)
+    batch, wrapped = _next_recheck_batch(client, state["cursor_published_at"])
+    if not batch:
+        return 0
+
+    thread_pub_map = {b["comment_id"]: b["published_at"] for b in batch}
+
+    # --- Pass 1: 50件ずつまとめて totalReplyCount + 生存確認を安く行う ---
+    youtube = get_youtube()
+    alive_ids: set[str] = set()
+    reply_counts: dict[str, int] = {}
+    quota_exhausted = False
+
+    for i in range(0, len(batch), RECHECK_ID_CHUNK):
+        chunk = [b["comment_id"] for b in batch[i:i + RECHECK_ID_CHUNK]]
+        while True:
+            try:
+                resp = youtube.commentThreads().list(
+                    part="snippet",
+                    id=",".join(chunk),
+                    textFormat="plainText",
+                    maxResults=50,
+                ).execute()
+                break
+            except HttpError as e:
+                if is_quota_error(e):
+                    if not rotate_key(e):
+                        quota_exhausted = True
+                        break
+                    youtube = get_youtube()
+                    continue
+                raise
+        if quota_exhausted:
+            break
+        for item in resp.get("items", []):
+            tid = item["id"]
+            alive_ids.add(tid)
+            reply_counts[tid] = item["snippet"].get("totalReplyCount", 0)
+
+    if quota_exhausted:
+        # 状態は進めず、次回同じカーソル位置からやり直す
+        print("  スレッド巡回チェックをスキップ（クォータ枯渇）")
+        return 0
+
+    # --- Turso 側の既知返信数(is_deleted=0)をまとめて取得 ---
+    checked_ids = [b["comment_id"] for b in batch]
+    known_counts: dict[str, int] = {}
+    for i in range(0, len(checked_ids), RECHECK_IN_CHUNK):
+        chunk = checked_ids[i:i + RECHECK_IN_CHUNK]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = client.query(
+            f"SELECT parent_id, COUNT(*) AS c FROM comments "
+            f"WHERE parent_id IN ({placeholders}) AND is_deleted = 0 GROUP BY parent_id",
+            chunk,
+        )
+        for r in rows:
+            known_counts[r["parent_id"]] = r["c"]
+
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+
+    # --- スレッド自体が消えた分は返信ごと削除扱いに(APIを叩かず既知IDを流用) ---
+    dead_ids = set(checked_ids) - alive_ids
+    _mark_deleted(client, list(dead_ids), now_epoch)
+    for tid in dead_ids:
+        known = client.query(
+            "SELECT comment_id FROM comments WHERE parent_id = ? AND is_deleted = 0", [tid],
+        )
+        _mark_deleted(client, [r["comment_id"] for r in known], now_epoch)
+
+    # --- 返信数が食い違うスレッドだけ完全再取得(Pass2) ---
+    mismatched = [
+        tid for tid in alive_ids
+        if reply_counts.get(tid, 0) != known_counts.get(tid, 0)
+    ]
+    sightings: dict = {}
+    written = 0
+    for tid in mismatched:
+        n, _deleted, exhausted = _resync_thread_replies(
+            youtube, client, tid, thread_pub_map[tid], now_epoch, sightings,
+        )
+        written += n
+        if exhausted:
+            break
+    upsert_author_sightings(client, sightings)
+
+    # --- カーソル更新(Pass1が完走した分だけ進める。Pass2の途中終了は次周期で再検知される) ---
+    last_pub = batch[-1]["published_at"]
+    if wrapped:
+        state["cycle_count"] += 1
+        state["cycle_started_at"] = now_epoch
+        state["threads_checked_in_cycle"] = len(batch)
+        print(f"  スレッド巡回チェック: 1周完了 → 第{state['cycle_count']}周を開始", flush=True)
+    else:
+        state["threads_checked_in_cycle"] += len(batch)
+    state["cursor_published_at"] = last_pub
+    _write_recheck_state(client, state, now_epoch)
+
+    print(
+        f"  スレッド巡回チェック: {len(batch)}件確認、食い違い{len(mismatched)}件、"
+        f"返信{written}件書込み、消滅{len(dead_ids)}件",
+        flush=True,
+    )
+    return written
 
 
 # ------------------------------------------------------------------ #
@@ -681,6 +905,10 @@ def main():
     if now.minute % REPLY_SYNC_INTERVAL_MIN == 0:
         n_reply = sync_recent_replies(client)
         print(f"  返信再同期: {n_reply} 件")
+
+    if now.minute % RECHECK_INTERVAL_MIN == 0:
+        n_recheck = run_reply_recheck_batch(client)
+        print(f"  スレッド巡回チェック書込み: {n_recheck} 件")
 
     # 毎分: 現在時間のバケットだけ再計算（軽い）
     # 10分おき: 直近6時間ぶんを広めに再計算し、上記の返信backfill・削除検知の

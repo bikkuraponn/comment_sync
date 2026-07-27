@@ -172,6 +172,11 @@ CREATE TABLE IF NOT EXISTS comment_authors (
 )
 """
 
+_AUTHORS_FIRST_SEEN_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_comment_authors_first_seen "
+    "ON comment_authors(first_seen_at)"
+)
+
 _UPSERT_AUTHOR_SQL = """
 INSERT INTO comment_authors (channel_id, handle, avatar_url, updated_at, first_seen_at)
 VALUES (?, ?, ?, ?, ?)
@@ -221,6 +226,7 @@ def upsert_author_sightings(client: TursoClient, sightings: dict) -> None:
     if not sightings:
         return
     client.execute(_AUTHORS_TABLE_SQL)
+    client.execute(_AUTHORS_FIRST_SEEN_INDEX_SQL)
     stmts = [
         {"sql": _UPSERT_AUTHOR_SQL,
          "args": [cid, s["handle"], s["avatar_url"], s["updated_at"], s.get("first_seen_at")]}

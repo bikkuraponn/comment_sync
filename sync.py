@@ -22,20 +22,24 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import dotenv
+import requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 dotenv.load_dotenv(Path(__file__).parent.parent / "flaskr" / ".env")
 dotenv.load_dotenv()
 
+import time_comment_common
 from turso_client import TursoClient
 
 VIDEO_ID = os.getenv("VIDEO_ID", "niKAylKNIEI")
 BATCH_SIZE = 300
+JST = ZoneInfo("Asia/Tokyo")
 
 # ------------------------------------------------------------------ #
 # API キーローテーション（ダッシュボード用 YOUTUBE_API_KEY は使わない）
@@ -1134,6 +1138,92 @@ def update_hourly_buckets(client: TursoClient, hours_back: int = 1) -> int:
 
 
 # ------------------------------------------------------------------ #
+# 時報コメントのリアルタイム反映（毎分同期に便乗、2026-07-29）
+#
+# 対象8時刻(time_comment_common.TARGET_TIMES)が実際に発生した後、
+# TIME_COMMENT_CHECK_WINDOW_MIN 分間だけ、そのちょうど1分幅の published_at
+# 範囲を毎分再チェックする。1回だけでなく複数回チェックするのは、YouTube側の
+# コメント反映(commentThreads.list への反映)に数分の遅延があり得るため
+# (hourly_archive.py の RETRY_BURST_MINUTES と同じ考え方)。
+#
+# 冪等性: 毎回「対象分の開始からの新着分だけ」ではなく、毎回同じ固定の1分幅を
+# 丸ごと再クエリし、group_matches/resolve_winners を再実行してUPSERTする。
+# これにより「1分目より2分目の方がより早い投稿を見つけた」場合も自動的に
+# 上書き訂正される(ON CONFLICT DO UPDATE)。「最初に見つかった勝者で確定・
+# 以降チェックしない」という早期終了は行わない — 毎分の再クエリは
+# idx_comments_published経由のインデックス済み・狭いSEARCHなので安価。
+#
+# 日次バッチ(analytics_aggregates_updater/main.py)との役割分担: こちらは
+# 「達成が確定した瞬間、ベストエフォートで即時反映する」担当。ウィンドウが
+# 閉じた後にYouTube側の反映がさらに遅れた場合の最終的な正しさは、従来通り
+# 翌日0:01JSTの日次バッチ(_REPROCESS_DAYS=2)が保証する。
+#
+# 「今日」にachieved=1を書くこと自体はtime_comment_dataの「今日はまだ行を
+# 持たない」設計ルール違反ではない — そのルールが禁じているのは「まだ発生
+# していない今日」に根拠のないachieved=0を書くこと。実際に達成が確定した
+# 瞬間にachieved=1を書くのはこの機能そのものの目的であり、
+# time_comment_common.upsert_achieved_only()はそもそもachieved=0を書く
+# 経路を持たない。
+# ------------------------------------------------------------------ #
+
+TIME_COMMENT_CHECK_WINDOW_MIN = 5  # hourly_archive.pyのRETRY_BURST_MINUTES=5と同じ考え方
+
+
+def _time_comment_targets_this_minute(now_jst: datetime) -> list[tuple[str, datetime]]:
+    """今チェックすべき (time_key, その対象分の開始JST datetime) の一覧を返す。"""
+    targets = []
+    for time_key in time_comment_common.TARGET_TIMES:
+        h, m = (int(x) for x in time_key.split(":"))
+        target_start = now_jst.replace(hour=h, minute=m, second=0, microsecond=0)
+        if target_start <= now_jst < target_start + timedelta(minutes=TIME_COMMENT_CHECK_WINDOW_MIN):
+            targets.append((time_key, target_start))
+    return targets
+
+
+def check_time_comments(client: TursoClient, now_jst: datetime) -> set[str]:
+    """対象時刻発生後の数分間だけ、その1分幅を再チェックして即時UPSERTする。
+
+    achieved=0は絶対に書かない(該当コメントが見つからなければ何もしない)。
+    戻り値: 今回実際に書き込んだ time_key の集合(呼び出し側のキャッシュクリア判定用)。
+    """
+    written: set[str] = set()
+    for time_key, target_start in _time_comment_targets_this_minute(now_jst):
+        start_epoch = int(target_start.astimezone(timezone.utc).timestamp())
+        end_epoch = start_epoch + 60
+        rows = client.query(
+            "SELECT rowid, comment_id, author_channel_id, handle, published_at, text, parent_id "
+            "FROM comments WHERE published_at >= ? AND published_at < ?",
+            [start_epoch, end_epoch],
+        )
+        groups = time_comment_common.group_matches(rows)
+        if not groups:
+            continue
+        winners, _unresolved = time_comment_common.resolve_winners(groups)
+        time_comment_common.upsert_achieved_only(client, set(groups.keys()), winners)
+        written.add(time_key)
+        print(f"  時報コメント即時反映: {time_key} {target_start.date().isoformat()} 達成", flush=True)
+    return written
+
+
+def _clear_time_comment_cache(time_key: str) -> None:
+    """flaskr の /time・/graph/time-comment の該当キャッシュを消す(ベストエフォート、
+    minutely_record/hourly_archive.py の _clear_button_stats_cache() と同じパターン)。"""
+    flask_base_url = os.getenv("FLASK_BASE_URL")
+    api_token = os.getenv("API_TOKEN")
+    if not (flask_base_url and api_token):
+        return
+    try:
+        requests.post(
+            f"{flask_base_url.rstrip('/')}/api/cache-clear-time-comment",
+            params={"time": time_key},
+            headers={"Authorization": f"Bearer {api_token}"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"  time-commentキャッシュクリア失敗({time_key}): {e}")
+
+
+# ------------------------------------------------------------------ #
 # エントリポイント
 # ------------------------------------------------------------------ #
 
@@ -1157,6 +1247,15 @@ def main():
 
     n_new = sync_new_comments(client)
     print(f"  新着: {n_new} 件")
+
+    now_jst = now.astimezone(JST)
+    try:
+        written_time_keys = check_time_comments(client, now_jst)
+    except Exception as e:
+        print(f"  時報コメント即時反映エラー: {e}", flush=True)
+        written_time_keys = set()
+    for time_key in written_time_keys:
+        _clear_time_comment_cache(time_key)
 
     # 10分おき: コールド層(全履歴のカーソル巡回)だけ
     # 30分おき: それに加えてホット層(直近24時間のスレッド全件)も見る

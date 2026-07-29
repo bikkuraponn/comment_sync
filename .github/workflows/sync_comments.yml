@@ -40,4 +40,6 @@ jobs:
           VIDEO_ID:         ${{ vars.VIDEO_ID }}
           TURSO_URL:        ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          FLASK_BASE_URL:   ${{ vars.FLASK_BASE_URL }}
+          API_TOKEN:        ${{ secrets.API_TOKEN }}
         run: python sync.py

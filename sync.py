@@ -157,12 +157,23 @@ def is_deleted_sentinel(snippet: dict) -> bool:
 
 
 def get_latest_thread_pub(client: TursoClient) -> int | None:
-    # idx_parent_published により1行読み取りで済む。
+    # idx_parent_published により1行読み取りで済む(is_deleted=0を足してもEXPLAIN QUERY PLAN
+    # で SEARCH USING INDEX のままであることを2026-07-29に確認済み。SCANにはならない)。
     # スレッドIDではなく published_at を停止条件にする:
     # 最新スレッドが YouTube 上で削除されると ID は二度と API 応答に
     # 現れず、全履歴をページングし続けてクォータを焼き尽くすため。
+    #
+    # is_deleted=0 を条件に含める理由(2026-07-29追加): comments 行は削除されても物理的に
+    # 消えず is_deleted フラグが立つだけなので、この条件が無いと MAX(published_at) は
+    # 削除されたスレッドの値を指したまま永久に固定される。sync_new_comments() の停止条件
+    # (stop_pub)がこの値を使っており、最新スレッドが削除されると1ページ目で新着を1件も
+    # 見ないまま既知データ域に達してしまい、固定コメント判定の分岐(_reconcile_pinned_comment)
+    # に古いスレッドが次々と誤って落ち、is_pinned の付け替えが連鎖する事故があった
+    # (詳細はそちらのコメント参照)。is_deleted=0 を足すことで、巡回チェックが該当スレッドの
+    # 削除を検知してis_deleted=1を確定させた後は、次の実行から自動的に「その次に新しい
+    # 生きているスレッド」に停止条件がずれ、自己修復する。
     rows = client.query(
-        "SELECT MAX(published_at) AS p FROM comments WHERE parent_id IS NULL"
+        "SELECT MAX(published_at) AS p FROM comments WHERE parent_id IS NULL AND is_deleted = 0"
     )
     return rows[0]["p"] if rows and rows[0]["p"] is not None else None
 
@@ -381,9 +392,18 @@ def fetch_all_replies(
     total_reply_count: int,
     now_epoch: int,
     sightings: dict | None = None,
-) -> list[dict]:
+) -> tuple:
+    """戻り値: (youtube, rows)。
+
+    youtube を返り値に含めるのは、内部でキーローテーションが起きた場合に呼び出し元
+    (sync_new_comments)がその後のスレッドでも更新済みの youtube を使うため
+    (2026-07-29修正。以前は関数ローカルの再代入が呼び出し元に伝播せず、この関数の中で
+    ローテーションしたキーを次のスレッドの呼び出しでは使わずに済ませてしまい、
+    枯渇済みキーへの無駄打ちで _exhausted_count が余分に加算され、本来無傷なはずの
+    次のキーまで無駄に読み飛ばすバグがあった。_pass1_reply_counts と同じ形に揃えた)。
+    """
     if total_reply_count <= len(included_replies):
-        return []
+        return youtube, []
 
     rows = []
     seen_ids = {r["id"] for r in included_replies}
@@ -407,7 +427,7 @@ def fetch_all_replies(
             if should_raise:
                 raise
             if exhausted:
-                return rows
+                return youtube, rows
             continue
 
         for r in resp.get("items", []):
@@ -440,7 +460,7 @@ def fetch_all_replies(
         if not next_page:
             break
 
-    return rows
+    return youtube, rows
 
 
 # ------------------------------------------------------------------ #
@@ -448,6 +468,16 @@ def fetch_all_replies(
 # ------------------------------------------------------------------ #
 
 MAX_PAGES = 30  # 安全弁: 毎分実行で30ページ(3000スレッド)を超える新着はあり得ない
+
+# 安全弁(2026-07-29追加): 固定コメントは常に1件だけの想定(この動画では実際に1件)。
+# 1回の実行で2回目の「固定コメント候補」に遭遇した場合、それは本物の固定コメント変更
+# ではなく stop_pub アンカー(get_latest_thread_pub)が壊れている兆候とみなす——
+# DB上「最新」とされるスレッドがYouTube側で削除されると、そのスレッドの published_at
+# に一致する item が二度と応答に現れず、1ページ目のitem全てが「新着未検出のまま
+# stop_pub以下」の状態に落ち、固定コメント判定が誤って連鎖してis_pinnedの付け替えを
+# 繰り返す事故があった。get_latest_thread_pub側にis_deleted=0を足したことで巡回チェックが
+# 削除を検知した後は自己修復するが、検知が遅れている間の被害はこのキャップで頭打ちにする。
+MAX_PINNED_RECONCILES_PER_RUN = 1
 
 
 def sync_new_comments(client: TursoClient) -> int:
@@ -462,6 +492,7 @@ def sync_new_comments(client: TursoClient) -> int:
     found_in_window = False  # 固定コメント(2024年投稿)が先頭に来る対策
     pages = 0
     rate_limit_retries = 0
+    pinned_reconciles = 0
 
     while True:
         try:
@@ -498,7 +529,17 @@ def sync_new_comments(client: TursoClient) -> int:
                     break
                 else:
                     # 1ページ目でまだ新着を1件も見ていない → 固定コメント
+                    if pinned_reconciles >= MAX_PINNED_RECONCILES_PER_RUN:
+                        print(
+                            f"  WARNING: 固定コメント候補が1回の実行で{pinned_reconciles + 1}件目に"
+                            f"到達。stop_pub({stop_pub})のアンカーとなるスレッドが削除された"
+                            f"疑いがあるため、誤ったis_pinned連鎖書き換えを避けてこの回の新着同期を"
+                            f"打ち切る(次回以降、削除検知が確定すれば自己修復する)。", flush=True,
+                        )
+                        found_stop = True
+                        break
                     _reconcile_pinned_comment(client, tid, top_snip, now_epoch)
+                    pinned_reconciles += 1
                     continue
             else:
                 found_in_window = True
@@ -546,8 +587,10 @@ def sync_new_comments(client: TursoClient) -> int:
                     "fetched_at": now_epoch,
                 })
 
-            # ここに到達するのは新着スレッドのみ（既知に達したら上で break 済み）
-            extra = fetch_all_replies(
+            # ここに到達するのは新着スレッドのみ（既知に達したら上で break 済み）。
+            # fetch_all_replies が内部でキーローテーションした場合に備え、更新後の
+            # youtube を必ず受け取って以降のスレッドに引き継ぐ(2026-07-29修正)。
+            youtube, extra = fetch_all_replies(
                 youtube, tid, thread_pub, inline_replies,
                 item["snippet"]["totalReplyCount"], now_epoch, sightings,
             )
@@ -615,10 +658,15 @@ def _mark_deleted(client: TursoClient, comment_ids: list[str], now_epoch: int) -
 
 def _resync_thread_replies(
     youtube, client: TursoClient, tid: str, thread_pub: int, now_epoch: int, sightings: dict,
-) -> tuple[int, int, bool]:
+) -> tuple:
     """スレッド1件ぶんの返信を全件再取得し、消えた返信を削除扱いにする。
 
-    戻り値: (書き込んだ返信件数, 削除検知した件数, クォータ枯渇で中断したか)
+    戻り値: (youtube, 書き込んだ返信件数, 削除検知した件数, クォータ枯渇で中断したか)
+
+    youtube を返り値に含める理由は fetch_all_replies と同じ(2026-07-29修正)。
+    以前は _recheck_threads の for ループが複数スレッドを処理する間、内部で起きた
+    キーローテーションが呼び出し元へ伝播せず、2スレッド目以降も枯渇済みキーを
+    使い続けてしまうバグがあった。
     """
     next_page = None
     order = 1
@@ -643,7 +691,7 @@ def _resync_thread_replies(
                 raise
             if exhausted:
                 upsert_rows(client, pending)
-                return len(pending), 0, True
+                return youtube, len(pending), 0, True
             continue
 
         for r in resp.get("items", []):
@@ -680,7 +728,7 @@ def _resync_thread_replies(
     )
     known_ids = {r["comment_id"] for r in known}
     deleted = _mark_deleted(client, list(known_ids - fetched_ids), now_epoch)
-    return len(pending), deleted, False
+    return youtube, len(pending), deleted, False
 
 
 # ------------------------------------------------------------------ #
@@ -1011,7 +1059,9 @@ def _recheck_threads(
     sightings: dict = {}
     written = 0
     for tid in to_resync:
-        n, _deleted, exhausted = _resync_thread_replies(
+        # 更新後の youtube を必ず受け取り、次のスレッドへ引き継ぐ(2026-07-29修正。
+        # 関数docstring参照)。
+        youtube, n, _deleted, exhausted = _resync_thread_replies(
             youtube, client, tid, thread_pub_map[tid], now_epoch, sightings,
         )
         written += n

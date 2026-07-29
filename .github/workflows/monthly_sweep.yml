@@ -1,17 +1,28 @@
-name: Sync Comments
+name: Monthly Sweep
 
 on:
   repository_dispatch:
-    types: [sync-comments]
+    types: [sync-comments-monthly]
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "遡る日数"
+        required: false
+        default: "31"
+      dry_run:
+        description: "対象件数と概算コストだけ出す"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
-  group: sync-comments
+  group: sync-comments-monthly
   cancel-in-progress: false
 
 jobs:
-  sync:
+  sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -24,6 +35,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Verify secret
+        if: github.event_name == 'repository_dispatch'
         env:
           CRONJOB_SECRET: ${{ secrets.CRONJOB_SECRET }}
         run: |
@@ -32,7 +44,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run sync
+      - name: Run monthly sweep
         env:
           API_KEY_FOR_ALL_COMMENT_GET:  ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET }}
           API_KEY_FOR_ALL_COMMENT_GET2: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET2 }}
@@ -40,4 +52,11 @@ jobs:
           VIDEO_ID:         ${{ vars.VIDEO_ID }}
           TURSO_URL:        ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-        run: python sync.py
+          SWEEP_DAYS:       ${{ github.event.inputs.days || '31' }}
+          SWEEP_DRY_RUN:    ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          ARGS="--days $SWEEP_DAYS"
+          if [[ "$SWEEP_DRY_RUN" == "true" ]]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python monthly_sweep.py $ARGS

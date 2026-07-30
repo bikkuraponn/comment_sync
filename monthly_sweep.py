@@ -52,13 +52,18 @@ CHUNK_THREADS = 5000
 
 
 def fetch_threads(client: TursoClient, days: int) -> list[dict]:
-    """対象期間に立ったスレッドを古い順に返す(idx_parent_published の SEARCH)。"""
+    """対象期間に立ったスレッドを古い順に返す(idx_parent_published の SEARCH)。
+
+    31日分で約6万行(2026-07-30実測)返るため、TursoClientの既定30秒では
+    ReadTimeoutになりうる(2026-07-30の初回dry-run実行で発生)。
+    """
     cutoff = int(datetime.now(timezone.utc).timestamp()) - days * 86400
     return client.query(
         "SELECT comment_id, published_at FROM comments "
         "WHERE parent_id IS NULL AND published_at >= ? "
         "ORDER BY published_at ASC",
         [cutoff],
+        timeout=120,
     )
 
 

@@ -12,18 +12,18 @@ class TursoClient:
             "Content-Type": "application/json",
         }
 
-    def execute(self, sql: str, args: list | None = None) -> dict:
-        result = self._pipeline([{"sql": sql, "args": args or []}])
+    def execute(self, sql: str, args: list | None = None, timeout: int = 30) -> dict:
+        result = self._pipeline([{"sql": sql, "args": args or []}], timeout=timeout)
         for rs in result.get("results", []):
             if rs.get("type") == "error":
                 raise RuntimeError(f"Turso error: {rs['error']['message']}")
         return result
 
-    def batch(self, statements: list[dict]) -> dict:
-        return self._pipeline(statements)
+    def batch(self, statements: list[dict], timeout: int = 30) -> dict:
+        return self._pipeline(statements, timeout=timeout)
 
-    def query(self, sql: str, args: list | None = None) -> list[dict]:
-        result = self._pipeline([{"sql": sql, "args": args or []}])
+    def query(self, sql: str, args: list | None = None, timeout: int = 30) -> list[dict]:
+        result = self._pipeline([{"sql": sql, "args": args or []}], timeout=timeout)
         rs = result["results"][0]
         if rs["type"] == "error":
             raise RuntimeError(rs["error"]["message"])
@@ -33,7 +33,7 @@ class TursoClient:
             for row in rs["response"]["result"]["rows"]
         ]
 
-    def _pipeline(self, statements: list[dict]) -> dict:
+    def _pipeline(self, statements: list[dict], timeout: int = 30) -> dict:
         body = []
         for stmt in statements:
             body.append({
@@ -49,7 +49,7 @@ class TursoClient:
             f"{self.base_url}/v2/pipeline",
             headers=self.headers,
             json={"requests": body},
-            timeout=30,
+            timeout=timeout,
         )
         resp.raise_for_status()
         return resp.json()

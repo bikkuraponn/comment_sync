@@ -51,22 +51,56 @@ _API_KEYS = [k for k in [
     os.getenv("API_KEY_FOR_ALL_COMMENT_GET3"),
 ] if k]
 _key_idx = 0
-_exhausted_count = 0
+
+# 日次クォータを実際に使い切ったと確認できたキーの番号。
+# 以前はこれが単一のカウンタ(_exhausted_count)で、日次クォータ枯渇による
+# ローテーションと、一時的なレート制限がバックオフ上限に達したことによる
+# ローテーションの両方が同じ数字を加算し、しかも成功時にリセットされなかった。
+# キーが3本なら、1回の実行中に無関係な一時的レート制限が3回起きただけで
+# 「全キーのクォータが枯渇」と判断して処理を打ち切ってしまう
+# — よりによって予備キーが一番欲しいコメント急増時に起きやすい誤判定だった。
+_exhausted_keys: set[int] = set()
+
+_rate_limit_rotations = 0
+# レート制限由来のローテーション回数の上限。全キーを2周してなお解消しないなら
+# 個別キーの問題ではないので諦める(無限ループ防止のためだけの値)。
+MAX_RATE_LIMIT_ROTATIONS = 2 * max(1, len(_API_KEYS))
 
 
 def get_youtube():
     return build("youtube", "v3", developerKey=_API_KEYS[_key_idx], cache_discovery=False)
 
 
-def rotate_key(e: Exception) -> bool:
-    global _key_idx, _exhausted_count
-    _exhausted_count += 1
-    if _exhausted_count >= len(_API_KEYS):
-        print(f"ERROR: 全キーのクォータが枯渇: {e}")
-        return False
-    _key_idx = (_key_idx + 1) % len(_API_KEYS)
-    print(f"APIキーをローテーション → キー {_key_idx + 1}")
-    return True
+def rotate_key(e: Exception, daily_quota: bool) -> bool:
+    """次に使えるキーへ切り替える。切り替え先が無ければ False。
+
+    daily_quota=True のときだけ、現在のキーを「その日はもう使えない」と記録する。
+    レート制限は数十〜百秒で回復する一時的なものなので、そのキーの1日の予算を
+    使い切ったことにはしない(記録してしまうと、まだ予算のあるキーを二度と
+    使わなくなる)。
+    """
+    global _key_idx, _rate_limit_rotations
+
+    if daily_quota:
+        _exhausted_keys.add(_key_idx)
+        if len(_exhausted_keys) >= len(_API_KEYS):
+            print(f"ERROR: 全キーの日次クォータが枯渇: {e}")
+            return False
+    else:
+        _rate_limit_rotations += 1
+        if _rate_limit_rotations > MAX_RATE_LIMIT_ROTATIONS:
+            print(f"ERROR: レート制限が全キーで解消しないため中断: {e}")
+            return False
+
+    for step in range(1, len(_API_KEYS) + 1):
+        candidate = (_key_idx + step) % len(_API_KEYS)
+        if candidate not in _exhausted_keys:
+            _key_idx = candidate
+            print(f"APIキーをローテーション → キー {candidate + 1}")
+            return True
+
+    print(f"ERROR: 全キーの日次クォータが枯渇: {e}")
+    return False
 
 
 def is_daily_quota_error(e: HttpError) -> bool:
@@ -125,7 +159,7 @@ def _handle_api_error(e: HttpError, youtube, rate_limit_retries: int):
     elif not is_daily_quota_error(e):
         return youtube, rate_limit_retries, True, False
 
-    if not rotate_key(e):
+    if not rotate_key(e, daily_quota=is_daily_quota_error(e)):
         return youtube, rate_limit_retries, False, True
     return get_youtube(), 0, False, False
 
@@ -399,7 +433,7 @@ def fetch_all_replies(
     (sync_new_comments)がその後のスレッドでも更新済みの youtube を使うため
     (2026-07-29修正。以前は関数ローカルの再代入が呼び出し元に伝播せず、この関数の中で
     ローテーションしたキーを次のスレッドの呼び出しでは使わずに済ませてしまい、
-    枯渇済みキーへの無駄打ちで _exhausted_count が余分に加算され、本来無傷なはずの
+    枯渇済みキーへの無駄打ちで枯渇判定が余分に進み、本来無傷なはずの
     次のキーまで無駄に読み飛ばすバグがあった。_pass1_reply_counts と同じ形に揃えた)。
     """
     if total_reply_count <= len(included_replies):
@@ -917,7 +951,7 @@ def _pass1_reply_counts(youtube, thread_ids: list[str]):
     呼び出し側(_recheck_threads)がその後の Pass2 で使う youtube を確実に
     更新済みのものにするため(以前は関数ローカルの再代入が呼び出し元に
     伝播せず、Pass1でローテーション済みのキーをPass2で使わずに古いキーへ
-    もう一度当ててしまい、_exhausted_count が二重にカウントされて本来
+    もう一度当ててしまい、枯渇判定が二重に進んで本来
     無傷なはずの次のキーまで無駄に読み飛ばすバグがあった)。
 
     切り詰め検知: レスポンスに nextPageToken があれば、渡したIDリストが

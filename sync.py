@@ -36,6 +36,7 @@ dotenv.load_dotenv()
 
 import time_comment_common
 import account_live_core
+import repair_queue
 from turso_client import TursoClient
 
 VIDEO_ID = os.getenv("VIDEO_ID", "[REDACTED_VIDEO_ID]")
@@ -1222,6 +1223,27 @@ def update_hourly_buckets(client: TursoClient, hours_back: int = 1) -> int:
     return hours_back
 
 
+def process_hourly_repair_queue(client: TursoClient, limit: int = 24) -> int:
+    """Repair historical hour buckets recorded by the monthly sweep."""
+    claims = repair_queue.load(client, "hourly_bucket", limit=limit)
+    completed = {}
+    for key, generation in claims.items():
+        try:
+            hour_start = int(key)
+            if hour_start < 0 or hour_start % 3600:
+                raise ValueError("invalid hour bucket")
+            bucket = compute_hour_bucket(client, hour_start)
+            client.execute(_UPSERT_HOURLY_SQL, [
+                hour_start, bucket["comment_count"], bucket["thread_count"],
+                bucket["reply_count"], json.dumps(bucket["handles"], ensure_ascii=False),
+            ])
+            completed[key] = generation
+        except Exception as exc:
+            repair_queue.fail(client, "hourly_bucket", [key], exc)
+    repair_queue.complete(client, "hourly_bucket", completed)
+    return len(completed)
+
+
 # ------------------------------------------------------------------ #
 # 時報コメントのリアルタイム反映（毎分同期に便乗、2026-07-29）
 #
@@ -1364,6 +1386,9 @@ def main():
     # 遅延を吸収する（daily_statsの_REPROCESS_DAYSと同じ考え方）
     hours_back = 6 if now.minute % 10 == 0 else 1
     n_hourly = update_hourly_buckets(client, hours_back=hours_back)
+    repaired_hourly = process_hourly_repair_queue(client)
+    if repaired_hourly:
+        print(f"  historical hourly buckets repaired: {repaired_hourly}", flush=True)
     print(f"  時間バケット更新: 直近{n_hourly}時間分")
 
 

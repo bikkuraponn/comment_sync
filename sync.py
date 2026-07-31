@@ -35,6 +35,7 @@ dotenv.load_dotenv(Path(__file__).parent.parent / "flaskr" / ".env")
 dotenv.load_dotenv()
 
 import time_comment_common
+import account_live_core
 from turso_client import TursoClient
 
 VIDEO_ID = os.getenv("VIDEO_ID", "[REDACTED_VIDEO_ID]")
@@ -1323,6 +1324,15 @@ def main():
         sys.exit(1)
 
     client = TursoClient(url, token)
+
+    # Account-page basic counts are a monotonic record of comments once seen,
+    # including rows later marked deleted.  Trigger setup is best-effort so a
+    # profile-schema problem never prevents the primary comment sync.
+    try:
+        if account_live_core.ensure_live_core_trigger(client):
+            print("  account profile live-core trigger ready", flush=True)
+    except Exception as e:
+        print(f"  account profile live-core trigger setup failed: {e}", flush=True)
 
     wait_until_next_minute()
 

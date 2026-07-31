@@ -11,6 +11,7 @@
      再び使ってしまう。→ 両関数の戻り値に youtube を追加。
 """
 import json
+import sqlite3
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from googleapiclient.errors import HttpError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sync
+import account_live_core
 
 
 def epoch_to_iso(epoch: int) -> str:
@@ -68,6 +70,20 @@ class FakeTurso:
 
     def batch(self, statements, timeout=30):
         self.batched.append(statements)
+        return {}
+
+
+class SqliteTurso:
+    def __init__(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+
+    def query(self, sql, args=None, timeout=30):
+        return [dict(row) for row in self.db.execute(sql, args or []).fetchall()]
+
+    def execute(self, sql, args=None, timeout=30):
+        self.db.execute(sql, args or [])
+        self.db.commit()
         return {}
 
 
@@ -155,6 +171,66 @@ class SyncNewCommentsPinnedCascadeTests(unittest.TestCase):
         self.assertEqual(result, 123)
         self.assertIn("is_deleted = 0", recorded["sql"])
         self.assertIn("parent_id IS NULL", recorded["sql"])
+
+
+class AccountLiveCoreTests(unittest.TestCase):
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, published_at INTEGER, is_deleted INTEGER, "
+            "fetched_at INTEGER)"
+        )
+        self.client.execute(
+            "CREATE TABLE account_profile_data (channel_id TEXT PRIMARY KEY, "
+            "core_payload TEXT NOT NULL, core_hash TEXT NOT NULL, core_updated_at INTEGER NOT NULL)"
+        )
+        core = {
+            "handle_snapshot": "@old", "first_comment_date": "2025-01-01",
+            "last_comment_date": "2025-01-01", "total_comments": 5,
+            "peak_total_comments": 5, "thread_count": 2, "reply_count": 3,
+            "thread_ratio": 0.4,
+        }
+        self.client.execute(
+            "INSERT INTO account_profile_data VALUES(?,?,?,?)",
+            ["UC0000000000000000000000", json.dumps(core), "old-hash", 1],
+        )
+
+    def _write_comment(self, comment_id, parent_id, published_at, deleted=0):
+        self.client.execute(
+            "INSERT INTO comments(comment_id,parent_id,author_channel_id,handle,published_at,is_deleted,fetched_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(comment_id) DO UPDATE SET fetched_at=excluded.fetched_at",
+            [comment_id, parent_id, "UC0000000000000000000000", "@new", published_at, deleted, published_at],
+        )
+
+    def test_real_insert_updates_basic_counts_and_deleted_rows_still_count(self):
+        self.assertTrue(account_live_core.ensure_live_core_trigger(self.client))
+        published = int(datetime(2025, 1, 2, 0, 0, tzinfo=timezone.utc).timestamp())
+        self._write_comment("new-deleted", None, published, deleted=1)
+
+        row = self.client.query("SELECT * FROM account_profile_data")[0]
+        core = json.loads(row["core_payload"])
+        self.assertEqual(6, core["total_comments"])
+        self.assertEqual(3, core["thread_count"])
+        self.assertEqual(3, core["reply_count"])
+        self.assertEqual(0.5, core["thread_ratio"])
+        self.assertEqual("2025-01-02", core["last_comment_date"])
+        self.assertEqual("@new", core["handle_snapshot"])
+        self.assertEqual("", row["core_hash"])
+
+        # The regular comment_sync conflict path must not fire the INSERT trigger.
+        self._write_comment("new-deleted", None, published, deleted=1)
+        core = json.loads(self.client.query("SELECT core_payload FROM account_profile_data")[0]["core_payload"])
+        self.assertEqual(6, core["total_comments"])
+
+    def test_setup_skips_a_comments_only_database(self):
+        client = SqliteTurso()
+        try:
+            client.execute("CREATE TABLE comments(comment_id TEXT PRIMARY KEY)")
+            self.assertFalse(account_live_core.ensure_live_core_trigger(client))
+        finally:
+            client.db.close()
 
 
 def make_http_error(status: int = 403, message: str = "quotaExceeded") -> HttpError:

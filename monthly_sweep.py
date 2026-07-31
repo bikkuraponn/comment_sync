@@ -28,9 +28,12 @@ import argparse
 import os
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from turso_client import TursoClient
+import repair_queue
 
 from sync import (
     RECHECK_ID_CHUNK,
@@ -49,6 +52,76 @@ TIME_BUDGET_SEC = 25 * 60
 # 1回の _recheck_threads に渡すスレッド数。全件を一度に渡すと Pass1 が
 # 全部終わるまで1件も書き込まれず、タイムアウト時に成果がゼロになる。
 CHUNK_THREADS = 5000
+SNAPSHOT_IN_CHUNK = 200
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def _snapshot_thread_rows(client: TursoClient, thread_ids: list[str]) -> dict[str, dict]:
+    """Read the rows whose active membership can change during Pass 2."""
+    snapshot: dict[str, dict] = {}
+    for offset in range(0, len(thread_ids), SNAPSHOT_IN_CHUNK):
+        chunk = thread_ids[offset:offset + SNAPSHOT_IN_CHUNK]
+        marks = ",".join("?" for _ in chunk)
+        rows = client.query(
+            "SELECT comment_id,parent_id,author_channel_id,handle,text,published_at,is_deleted "
+            f"FROM comments WHERE comment_id IN ({marks}) OR parent_id IN ({marks})",
+            [*chunk, *chunk],
+        )
+        for row in rows:
+            snapshot[row["comment_id"]] = row
+    return snapshot
+
+
+def _changed_rows(before: dict[str, dict], after: dict[str, dict]) -> list[dict]:
+    """Return both sides of every insert/delete or aggregate-relevant edit."""
+    changed: list[dict] = []
+    for comment_id in set(before) | set(after):
+        old = before.get(comment_id)
+        new = after.get(comment_id)
+        fields = (
+            "parent_id", "author_channel_id", "handle", "text", "published_at", "is_deleted",
+        )
+        if old is None or new is None or any(old.get(field) != new.get(field) for field in fields):
+            if old is not None:
+                changed.append(old)
+            if new is not None:
+                changed.append(new)
+    return changed
+
+
+def _repair_work(rows: list[dict]) -> dict[str, set[str]]:
+    work: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        stamp = row.get("published_at")
+        if stamp is None:
+            continue
+        dt = datetime.fromtimestamp(int(stamp), JST)
+        day = dt.date().isoformat()
+        hour_start = (int(stamp) // 3600) * 3600
+        for consumer in (
+            "ranking_date", "daily_stats_date", "analytics_date",
+            "wordcloud_recent7d_date", "wordcloud_recent30d_date",
+        ):
+            work[consumer].add(day)
+        work["hourly_bucket"].add(str(hour_start))
+        author_id = row.get("author_channel_id")
+        if author_id:
+            work["account_profile"].add(str(author_id))
+    if rows:
+        work["network_full"].add("required")
+        work["calendar_wordcloud_full"].add("required")
+        work["account_map"].add("required")
+    return work
+
+
+def _persist_chunk_repairs(
+    client: TursoClient, thread_ids: list[str], before: dict[str, dict],
+) -> tuple[int, int]:
+    after = _snapshot_thread_rows(client, thread_ids)
+    changed = _changed_rows(before, after)
+    work = _repair_work(changed)
+    queued = repair_queue.enqueue(client, work) if work else 0
+    return len(changed), queued
 
 
 def fetch_threads(client: TursoClient, days: int) -> list[dict]:
@@ -104,6 +177,7 @@ def main() -> None:
     youtube = get_youtube()
     total_written = total_dead = total_mismatch = 0
     processed = 0
+    changed_count = queued_count = 0
 
     for i in range(0, len(threads), CHUNK_THREADS):
         elapsed = time.monotonic() - started
@@ -113,16 +187,29 @@ def main() -> None:
             break
 
         chunk = threads[i:i + CHUNK_THREADS]
+        thread_ids = [row["comment_id"] for row in chunk]
+        before = _snapshot_thread_rows(client, thread_ids)
         # pass2_cap は指定しない(無制限) — 月次スイープは TIME_BUDGET_SEC +
         # チャンク分割で実行時間を管理しており、Pass2 を人為的に絞ると
         # 「毎月一括で確実に整合性を取る」という役割そのものが弱まるため。
-        written, dead, mismatch, aborted, _deferred = _recheck_threads(
-            client, youtube, chunk, "月次スイープ",
-        )
+        try:
+            written, dead, mismatch, aborted, _deferred = _recheck_threads(
+                client, youtube, chunk, "月次スイープ",
+            )
+        except Exception:
+            # Writes may already have succeeded. Persist their repair work
+            # before propagating the failure so aggregates cannot drift.
+            changed, queued = _persist_chunk_repairs(client, thread_ids, before)
+            changed_count += changed
+            queued_count += queued
+            raise
         total_written += written
         total_dead += dead
         total_mismatch += mismatch
         processed += len(chunk)
+        changed, queued = _persist_chunk_repairs(client, thread_ids, before)
+        changed_count += changed
+        queued_count += queued
         print(f"  進捗 {processed}/{len(threads)}: "
               f"食い違い{mismatch}件、返信{written}件書込み、消滅{dead}件", flush=True)
 
@@ -130,6 +217,7 @@ def main() -> None:
             print("  中断（クォータ枯渇 または Pass1 の切り詰め検知）", flush=True)
             break
 
+    print(f"  集計修復キュー: 変更行{changed_count}件 / work {queued_count}件", flush=True)
     print(f"月次スイープ完了: {processed}/{len(threads)} 件確認、"
           f"食い違い{total_mismatch}件、返信{total_written}件書込み、消滅{total_dead}件、"
           f"所要 {time.monotonic() - started:.0f}s", flush=True)

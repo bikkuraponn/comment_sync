@@ -61,14 +61,12 @@ jobs:
       - name: Run monthly sweep
         if: steps.jst_gate.outputs.run == 'true'
         env:
-          API_KEY_FOR_ALL_COMMENT_GET:  ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET }}
-          API_KEY_FOR_ALL_COMMENT_GET2: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET2 }}
-          API_KEY_FOR_ALL_COMMENT_GET3: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET3 }}
-          VIDEO_ID:         ${{ vars.VIDEO_ID }}
-          TURSO_URL:        ${{ secrets.TURSO_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          SWEEP_DAYS:       ${{ github.event.inputs.days || '31' }}
-          SWEEP_DRY_RUN:    ${{ github.event.inputs.dry_run || 'false' }}
+          API_KEY_FOR_MONTHLY_SWEEP: ${{ secrets.API_KEY_FOR_MONTHLY_SWEEP }}
+          VIDEO_ID:                  ${{ vars.VIDEO_ID }}
+          TURSO_URL:                 ${{ secrets.TURSO_URL }}
+          TURSO_AUTH_TOKEN:          ${{ secrets.TURSO_AUTH_TOKEN }}
+          SWEEP_DAYS:                ${{ github.event.inputs.days || '31' }}
+          SWEEP_DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           ARGS="--days $SWEEP_DAYS"
           if [[ "$SWEEP_DRY_RUN" == "true" ]]; then

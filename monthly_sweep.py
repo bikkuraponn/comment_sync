@@ -47,7 +47,7 @@ DEFAULT_DAYS = 31
 # GitHub Actions の timeout-minutes より短く切り上げ、途中で強制終了されて
 # ログを失うのを避ける。打ち切っても次の月次実行でやり直せる
 # (カーソルを持たない = 常に「直近N日」を見るだけなので状態の引き継ぎは不要)。
-TIME_BUDGET_SEC = 25 * 60
+TIME_BUDGET_SEC = 110 * 60
 
 # 1回の _recheck_threads に渡すスレッド数。全件を一度に渡すと Pass1 が
 # 全部終わるまで1件も書き込まれず、タイムアウト時に成果がゼロになる。

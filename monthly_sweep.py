@@ -34,20 +34,19 @@ from zoneinfo import ZoneInfo
 
 from turso_client import TursoClient
 import repair_queue
-
+import sync as sync_module
 from sync import (
     RECHECK_ID_CHUNK,
-    _API_KEYS,
     _recheck_threads,
-    get_youtube,
 )
 
+MONTHLY_API_KEY = os.getenv("API_KEY_FOR_MONTHLY_SWEEP", "").strip()
 DEFAULT_DAYS = 31
 
 # GitHub Actions の timeout-minutes より短く切り上げ、途中で強制終了されて
 # ログを失うのを避ける。打ち切っても次の月次実行でやり直せる
 # (カーソルを持たない = 常に「直近N日」を見るだけなので状態の引き継ぎは不要)。
-TIME_BUDGET_SEC = 25 * 60
+TIME_BUDGET_SEC = 110 * 60
 
 # 1回の _recheck_threads に渡すスレッド数。全件を一度に渡すと Pass1 が
 # 全部終わるまで1件も書き込まれず、タイムアウト時に成果がゼロになる。
@@ -148,9 +147,10 @@ def main() -> None:
                         help="対象件数と概算コストだけ出して終了する")
     args = parser.parse_args()
 
-    if not _API_KEYS:
-        print("ERROR: API_KEY_FOR_ALL_COMMENT_GET を設定してください")
+    if not MONTHLY_API_KEY:
+        print("ERROR: API_KEY_FOR_MONTHLY_SWEEP を設定してください")
         sys.exit(1)
+    sync_module.configure_api_keys([MONTHLY_API_KEY], allow_rotation=False)
 
     url = os.getenv("TURSO_URL")
     token = os.getenv("TURSO_AUTH_TOKEN")
@@ -174,7 +174,7 @@ def main() -> None:
     if not threads:
         return
 
-    youtube = get_youtube()
+    youtube = sync_module.get_youtube()
     total_written = total_dead = total_mismatch = 0
     processed = 0
     changed_count = queued_count = 0

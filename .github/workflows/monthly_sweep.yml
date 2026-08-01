@@ -1,6 +1,11 @@
 name: Monthly Sweep
 
 on:
+  # 15:10 UTC is 00:10 JST on the following calendar day.  Run only on
+  # possible month-end UTC dates, then gate the actual sweep on JST day 1
+  # below.  This avoids relying on an external cron-job.org dispatch.
+  schedule:
+    - cron: "10 15 28-31 * *"
   repository_dispatch:
     types: [sync-comments-monthly]
   workflow_dispatch:
@@ -55,6 +60,10 @@ jobs:
           SWEEP_DAYS:       ${{ github.event.inputs.days || '31' }}
           SWEEP_DRY_RUN:    ${{ github.event.inputs.dry_run || 'false' }}
         run: |
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$(TZ=Asia/Tokyo date +%d)" != "01" ]]; then
+            echo "Not the first day of the month in JST; skipping monthly sweep."
+            exit 0
+          fi
           ARGS="--days $SWEEP_DAYS"
           if [[ "$SWEEP_DRY_RUN" == "true" ]]; then
             ARGS="$ARGS --dry-run"

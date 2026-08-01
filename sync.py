@@ -1114,6 +1114,7 @@ def _recheck_threads(
 
     sightings: dict = {}
     written = 0
+    pass2_exhausted = False
     for tid in to_resync:
         # 更新後の youtube を必ず受け取り、次のスレッドへ引き継ぐ(2026-07-29修正。
         # 関数docstring参照)。
@@ -1122,10 +1123,11 @@ def _recheck_threads(
         )
         written += n
         if exhausted:
+            pass2_exhausted = True
             break
     upsert_author_sightings(client, sightings)
 
-    return written, len(dead_ids), len(mismatched), False, deferred_count
+    return written, len(dead_ids), len(mismatched), pass2_exhausted, deferred_count
 
 
 def run_reply_recheck_batch(client: TursoClient, include_hot: bool) -> int:

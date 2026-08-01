@@ -67,6 +67,20 @@ _rate_limit_rotations = 0
 # レート制限由来のローテーション回数の上限。全キーを2周してなお解消しないなら
 # 個別キーの問題ではないので諦める(無限ループ防止のためだけの値)。
 MAX_RATE_LIMIT_ROTATIONS = 2 * max(1, len(_API_KEYS))
+_allow_key_rotation = True
+
+
+def configure_api_keys(api_keys: list[str], *, allow_rotation: bool = True) -> None:
+    """Replace the process-local API key pool for a specialized entry point."""
+    global _API_KEYS, _key_idx, _rate_limit_rotations
+    global MAX_RATE_LIMIT_ROTATIONS, _allow_key_rotation
+
+    _API_KEYS = [key.strip() for key in api_keys if key and key.strip()]
+    _key_idx = 0
+    _exhausted_keys.clear()
+    _rate_limit_rotations = 0
+    MAX_RATE_LIMIT_ROTATIONS = 2 * max(1, len(_API_KEYS))
+    _allow_key_rotation = bool(allow_rotation)
 
 
 def get_youtube():
@@ -82,6 +96,12 @@ def rotate_key(e: Exception, daily_quota: bool) -> bool:
     使わなくなる)。
     """
     global _key_idx, _rate_limit_rotations
+
+    if not _allow_key_rotation:
+        if daily_quota:
+            _exhausted_keys.add(_key_idx)
+        print(f"ERROR: API key unavailable; rotation is disabled: {e}")
+        return False
 
     if daily_quota:
         _exhausted_keys.add(_key_idx)

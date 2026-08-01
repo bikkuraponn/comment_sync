@@ -1,7 +1,22 @@
 import unittest
+import sqlite3
 from datetime import datetime
 
 import monthly_sweep
+
+
+class SqliteTurso:
+    def __init__(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+
+    def query(self, sql, args=None, timeout=30):
+        return [dict(row) for row in self.db.execute(sql, args or []).fetchall()]
+
+    def execute(self, sql, args=None, timeout=30):
+        self.db.execute(sql, args or [])
+        self.db.commit()
+        return {}
 
 
 class MonthlySweepRepairTests(unittest.TestCase):
@@ -35,6 +50,56 @@ class MonthlySweepRepairTests(unittest.TestCase):
         self.assertEqual(work["network_full"], {"required"})
         self.assertEqual(work["calendar_wordcloud_full"], {"required"})
         self.assertEqual(work["account_map"], {"required"})
+
+
+class MonthlySweepResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, published_at INTEGER)"
+        )
+        for comment_id, parent_id, published_at in (
+            ("t2", None, 100),
+            ("t1", None, 100),
+            ("t3", None, 200),
+            ("t4", None, 300),
+            ("t5", None, 400),
+            ("reply", "t1", 150),
+            ("outside", None, -100000),
+        ):
+            self.client.execute(
+                "INSERT INTO comments(comment_id,parent_id,published_at) VALUES(?,?,?)",
+                [comment_id, parent_id, published_at],
+            )
+
+    def test_initial_offset_and_checkpoints_use_stable_composite_cursor(self):
+        state, remaining = monthly_sweep.initialize_state(
+            self.client, days=1, window_end=500, resume_offset=2,
+        )
+        self.assertEqual(state["processed_count"], 2)
+        self.assertEqual(state["total_count"], 5)
+        self.assertEqual(state["cursor_comment_id"], "t2")
+        self.assertEqual([row["comment_id"] for row in remaining], ["t3", "t4", "t5"])
+
+        monthly_sweep.checkpoint_state(self.client, state, remaining[:2])
+        loaded = monthly_sweep.load_state(self.client)
+        self.assertEqual(loaded["processed_count"], 4)
+        self.assertEqual(loaded["cursor_comment_id"], "t4")
+
+        resumed = monthly_sweep.fetch_threads(
+            self.client,
+            loaded["window_start"],
+            loaded["window_end"],
+            loaded["cursor_published_at"],
+            loaded["cursor_comment_id"],
+        )
+        self.assertEqual([row["comment_id"] for row in resumed], ["t5"])
+
+        monthly_sweep.checkpoint_state(self.client, state, resumed)
+        monthly_sweep.complete_state(self.client, state)
+        completed = monthly_sweep.load_state(self.client)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["processed_count"], 5)
 
 
 if __name__ == "__main__":

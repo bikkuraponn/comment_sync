@@ -53,6 +53,23 @@ TIME_BUDGET_SEC = 110 * 60
 CHUNK_THREADS = 5000
 SNAPSHOT_IN_CHUNK = 200
 JST = ZoneInfo("Asia/Tokyo")
+STATE_KEY = "monthly"
+INCOMPLETE_EXIT_CODE = 2
+
+STATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS monthly_sweep_state (
+  state_key TEXT PRIMARY KEY,
+  run_month TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  window_end INTEGER NOT NULL,
+  cursor_published_at INTEGER,
+  cursor_comment_id TEXT,
+  processed_count INTEGER NOT NULL,
+  total_count INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+)
+"""
 
 
 def _snapshot_thread_rows(client: TursoClient, thread_ids: list[str]) -> dict[str, dict]:
@@ -123,19 +140,115 @@ def _persist_chunk_repairs(
     return len(changed), queued
 
 
-def fetch_threads(client: TursoClient, days: int) -> list[dict]:
-    """対象期間に立ったスレッドを古い順に返す(idx_parent_published の SEARCH)。
+def ensure_state_table(client: TursoClient) -> None:
+    client.execute(STATE_TABLE_SQL)
 
-    31日分で約6万行(2026-07-30実測)返るため、TursoClientの既定30秒では
-    ReadTimeoutになりうる(2026-07-30の初回dry-run実行で発生)。
-    """
-    cutoff = int(datetime.now(timezone.utc).timestamp()) - days * 86400
-    return client.query(
+
+def load_state(client: TursoClient) -> dict | None:
+    ensure_state_table(client)
+    rows = client.query(
+        "SELECT state_key,run_month,window_start,window_end,cursor_published_at,"
+        "cursor_comment_id,processed_count,total_count,status,updated_at "
+        "FROM monthly_sweep_state WHERE state_key=?",
+        [STATE_KEY],
+    )
+    return rows[0] if rows else None
+
+
+def fetch_threads(
+    client: TursoClient,
+    window_start: int,
+    window_end: int,
+    cursor_published_at: int | None = None,
+    cursor_comment_id: str | None = None,
+) -> list[dict]:
+    """Return a stable, fixed-window thread snapshot after an optional cursor."""
+    sql = (
         "SELECT comment_id, published_at FROM comments "
-        "WHERE parent_id IS NULL AND published_at >= ? "
-        "ORDER BY published_at ASC",
-        [cutoff],
-        timeout=120,
+        "WHERE parent_id IS NULL AND published_at >= ? AND published_at <= ?"
+    )
+    args: list = [window_start, window_end]
+    if cursor_published_at is not None and cursor_comment_id is not None:
+        sql += " AND (published_at > ? OR (published_at = ? AND comment_id > ?))"
+        args.extend([cursor_published_at, cursor_published_at, cursor_comment_id])
+    sql += " ORDER BY published_at ASC, comment_id ASC"
+    return client.query(sql, args, timeout=120)
+
+
+def initialize_state(
+    client: TursoClient,
+    days: int,
+    window_end: int,
+    resume_offset: int,
+) -> tuple[dict, list[dict]]:
+    window_start = window_end - days * 86400
+    threads = fetch_threads(client, window_start, window_end)
+    if resume_offset < 0 or resume_offset > len(threads):
+        raise ValueError(
+            f"resume offset {resume_offset} is outside 0..{len(threads)}"
+        )
+
+    cursor = threads[resume_offset - 1] if resume_offset else None
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    run_month = datetime.fromtimestamp(window_end, JST).strftime("%Y-%m")
+    state = {
+        "state_key": STATE_KEY,
+        "run_month": run_month,
+        "window_start": window_start,
+        "window_end": window_end,
+        "cursor_published_at": cursor["published_at"] if cursor else None,
+        "cursor_comment_id": cursor["comment_id"] if cursor else None,
+        "processed_count": resume_offset,
+        "total_count": len(threads),
+        "status": "in_progress",
+        "updated_at": now_epoch,
+    }
+    ensure_state_table(client)
+    client.execute(
+        "INSERT INTO monthly_sweep_state "
+        "(state_key,run_month,window_start,window_end,cursor_published_at,"
+        "cursor_comment_id,processed_count,total_count,status,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(state_key) DO UPDATE SET "
+        "run_month=excluded.run_month,window_start=excluded.window_start,"
+        "window_end=excluded.window_end,"
+        "cursor_published_at=excluded.cursor_published_at,"
+        "cursor_comment_id=excluded.cursor_comment_id,"
+        "processed_count=excluded.processed_count,total_count=excluded.total_count,"
+        "status=excluded.status,updated_at=excluded.updated_at",
+        [
+            STATE_KEY, run_month, window_start, window_end,
+            state["cursor_published_at"], state["cursor_comment_id"],
+            resume_offset, len(threads), "in_progress", now_epoch,
+        ],
+    )
+    return state, threads[resume_offset:]
+
+
+def checkpoint_state(client: TursoClient, state: dict, chunk: list[dict]) -> None:
+    last = chunk[-1]
+    state["cursor_published_at"] = int(last["published_at"])
+    state["cursor_comment_id"] = str(last["comment_id"])
+    state["processed_count"] += len(chunk)
+    state["updated_at"] = int(datetime.now(timezone.utc).timestamp())
+    client.execute(
+        "UPDATE monthly_sweep_state SET cursor_published_at=?,cursor_comment_id=?,"
+        "processed_count=?,updated_at=? WHERE state_key=? AND status='in_progress'",
+        [
+            state["cursor_published_at"], state["cursor_comment_id"],
+            state["processed_count"], state["updated_at"], STATE_KEY,
+        ],
+    )
+
+
+def complete_state(client: TursoClient, state: dict) -> None:
+    state["status"] = "completed"
+    state["processed_count"] = state["total_count"]
+    state["updated_at"] = int(datetime.now(timezone.utc).timestamp())
+    client.execute(
+        "UPDATE monthly_sweep_state SET processed_count=?,status='completed',updated_at=? "
+        "WHERE state_key=?",
+        [state["processed_count"], state["updated_at"], STATE_KEY],
     )
 
 
@@ -143,6 +256,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS,
                         help=f"遡る日数 (既定: {DEFAULT_DAYS})")
+    parser.add_argument("--window-end", type=int,
+                        help="固定スキャン窓の終了epoch秒")
+    parser.add_argument("--resume-offset", type=int, default=0,
+                        help="初回状態作成時に処理済みとして飛ばす件数")
+    parser.add_argument("--restart", action="store_true",
+                        help="既存状態を破棄して新しい固定窓を開始する")
     parser.add_argument("--dry-run", action="store_true",
                         help="対象件数と概算コストだけ出して終了する")
     args = parser.parse_args()
@@ -160,30 +279,86 @@ def main() -> None:
 
     client = TursoClient(url, token)
     started = time.monotonic()
+    requested_end = args.window_end or int(datetime.now(timezone.utc).timestamp())
+    requested_start = requested_end - args.days * 86400
+    requested_month = datetime.fromtimestamp(requested_end, JST).strftime("%Y-%m")
 
     print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC] "
           f"月次スイープ開始（直近{args.days}日）", flush=True)
 
-    threads = fetch_threads(client, args.days)
-    pass1_units = -(-len(threads) // RECHECK_ID_CHUNK)  # 切り上げ
-    print(f"  対象スレッド: {len(threads)} 件 / Pass1 概算 {pass1_units} units", flush=True)
-
     if args.dry_run:
+        preview = fetch_threads(client, requested_start, requested_end)
+        if args.resume_offset < 0 or args.resume_offset > len(preview):
+            raise ValueError(
+                f"resume offset {args.resume_offset} is outside 0..{len(preview)}"
+            )
+        remaining = len(preview) - args.resume_offset
+        pass1_units = -(-remaining // RECHECK_ID_CHUNK)
+        print(
+            f"  固定窓: {requested_start}..{requested_end} / "
+            f"全{len(preview)}件 / 再開後{remaining}件 / "
+            f"Pass1概算{pass1_units} units",
+            flush=True,
+        )
         print("  --dry-run のため API は叩かずに終了", flush=True)
         return
-    if not threads:
+
+    state = load_state(client)
+    if state and state["status"] == "in_progress" and not args.restart:
+        threads = fetch_threads(
+            client,
+            int(state["window_start"]),
+            int(state["window_end"]),
+            state.get("cursor_published_at"),
+            state.get("cursor_comment_id"),
+        )
+        expected_remaining = int(state["total_count"]) - int(state["processed_count"])
+        if len(threads) != expected_remaining:
+            raise RuntimeError(
+                "fixed-window thread count changed while resuming: "
+                f"expected {expected_remaining}, got {len(threads)}"
+            )
+        print(
+            f"  再開: {state['processed_count']}/{state['total_count']}件完了済み / "
+            f"固定窓 {state['window_start']}..{state['window_end']}",
+            flush=True,
+        )
+    elif (
+        state and state["status"] == "completed"
+        and state["run_month"] == requested_month and not args.restart
+    ):
+        print(
+            f"  {requested_month} の月次スイープは既に完了済み "
+            f"({state['processed_count']}/{state['total_count']})",
+            flush=True,
+        )
         return
+    else:
+        state, threads = initialize_state(
+            client, args.days, requested_end, args.resume_offset,
+        )
+        print(
+            f"  新規状態: {state['processed_count']}/{state['total_count']}件完了済み / "
+            f"固定窓 {state['window_start']}..{state['window_end']}",
+            flush=True,
+        )
+
+    pass1_units = -(-len(threads) // RECHECK_ID_CHUNK)
+    print(
+        f"  今回対象: {len(threads)}件 / 全体{state['total_count']}件 / "
+        f"Pass1概算{pass1_units} units",
+        flush=True,
+    )
 
     youtube = sync_module.get_youtube()
     total_written = total_dead = total_mismatch = 0
-    processed = 0
     changed_count = queued_count = 0
+    incomplete_reason = None
 
     for i in range(0, len(threads), CHUNK_THREADS):
         elapsed = time.monotonic() - started
         if elapsed > TIME_BUDGET_SEC:
-            print(f"  WARNING: 時間予算 {TIME_BUDGET_SEC}s を超過したため打ち切り"
-                  f"（{processed}/{len(threads)} 件処理済み）", flush=True)
+            incomplete_reason = f"時間予算 {TIME_BUDGET_SEC}s 超過"
             break
 
         chunk = threads[i:i + CHUNK_THREADS]
@@ -206,21 +381,47 @@ def main() -> None:
         total_written += written
         total_dead += dead
         total_mismatch += mismatch
-        processed += len(chunk)
         changed, queued = _persist_chunk_repairs(client, thread_ids, before)
         changed_count += changed
         queued_count += queued
-        print(f"  進捗 {processed}/{len(threads)}: "
-              f"食い違い{mismatch}件、返信{written}件書込み、消滅{dead}件", flush=True)
 
         if aborted:
-            print("  中断（クォータ枯渇 または Pass1 の切り詰め検知）", flush=True)
+            incomplete_reason = "クォータ枯渇またはAPIレスポンス切り詰め"
+            print(
+                f"  チャンク未完了のためカーソル維持: "
+                f"{state['processed_count']}/{state['total_count']}",
+                flush=True,
+            )
             break
 
+        checkpoint_state(client, state, chunk)
+        print(
+            f"  進捗 {state['processed_count']}/{state['total_count']}: "
+            f"食い違い{mismatch}件、返信{written}件書込み、消滅{dead}件",
+            flush=True,
+        )
+
     print(f"  集計修復キュー: 変更行{changed_count}件 / work {queued_count}件", flush=True)
-    print(f"月次スイープ完了: {processed}/{len(threads)} 件確認、"
-          f"食い違い{total_mismatch}件、返信{total_written}件書込み、消滅{total_dead}件、"
-          f"所要 {time.monotonic() - started:.0f}s", flush=True)
+    if incomplete_reason:
+        print(
+            f"月次スイープ未完了: {state['processed_count']}/{state['total_count']}件 / "
+            f"理由={incomplete_reason} / 次回は保存カーソルから再開 / "
+            f"所要 {time.monotonic() - started:.0f}s",
+            flush=True,
+        )
+        raise SystemExit(INCOMPLETE_EXIT_CODE)
+
+    if state["processed_count"] != state["total_count"]:
+        raise RuntimeError(
+            f"completion count mismatch: {state['processed_count']} != {state['total_count']}"
+        )
+    complete_state(client, state)
+    print(
+        f"月次スイープ完了: {state['processed_count']}/{state['total_count']}件確認、"
+        f"食い違い{total_mismatch}件、返信{total_written}件書込み、"
+        f"消滅{total_dead}件、所要 {time.monotonic() - started:.0f}s",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

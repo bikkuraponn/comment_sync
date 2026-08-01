@@ -9,6 +9,19 @@ on:
         description: "遡る日数"
         required: false
         default: "31"
+      window_end:
+        description: "固定スキャン窓の終了epoch秒（初回再開用）"
+        required: false
+        default: ""
+      resume_offset:
+        description: "初回状態作成時の処理済み件数"
+        required: false
+        default: "0"
+      restart:
+        description: "既存カーソルを破棄して新規開始"
+        type: boolean
+        required: false
+        default: false
       dry_run:
         description: "対象件数と概算コストだけ出す"
         type: boolean
@@ -66,9 +79,21 @@ jobs:
           TURSO_URL:                 ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN:          ${{ secrets.TURSO_AUTH_TOKEN }}
           SWEEP_DAYS:                ${{ github.event.inputs.days || '31' }}
+          SWEEP_WINDOW_END:          ${{ github.event.inputs.window_end || '' }}
+          SWEEP_RESUME_OFFSET:       ${{ github.event.inputs.resume_offset || '0' }}
+          SWEEP_RESTART:             ${{ github.event.inputs.restart || 'false' }}
           SWEEP_DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           ARGS="--days $SWEEP_DAYS"
+          if [[ -n "$SWEEP_WINDOW_END" ]]; then
+            ARGS="$ARGS --window-end $SWEEP_WINDOW_END"
+          fi
+          if [[ "$SWEEP_RESUME_OFFSET" != "0" ]]; then
+            ARGS="$ARGS --resume-offset $SWEEP_RESUME_OFFSET"
+          fi
+          if [[ "$SWEEP_RESTART" == "true" ]]; then
+            ARGS="$ARGS --restart"
+          fi
           if [[ "$SWEEP_DRY_RUN" == "true" ]]; then
             ARGS="$ARGS --dry-run"
           fi

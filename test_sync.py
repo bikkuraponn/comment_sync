@@ -353,6 +353,24 @@ class KeyRotationPropagationTests(unittest.TestCase):
         self.assertIs(received_youtube_per_call[1], rotated_per_call[0],
                        "2件目は1件目が返したyoutubeを受け取るべき(旧バグではPass1直後のものを再利用していた)")
 
+    def test_recheck_threads_reports_pass2_quota_exhaustion_as_aborted(self):
+        threads = [{"comment_id": "t1", "published_at": 100}]
+        client = FakeTurso()
+        with patch.object(
+            sync, "_pass1_reply_counts",
+            return_value=(object(), {"t1"}, {"t1": 5}, False, False),
+        ), patch.object(
+            sync, "_known_reply_counts", return_value={"t1": 0},
+        ), patch.object(
+            sync, "_resync_thread_replies",
+            return_value=(object(), 0, 0, True),
+        ):
+            _written, _dead, _mismatch, aborted, _deferred = sync._recheck_threads(
+                client, object(), threads, "test", pass2_cap=None,
+            )
+
+        self.assertTrue(aborted)
+
 
 if __name__ == "__main__":
     unittest.main()

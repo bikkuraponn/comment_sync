@@ -24,18 +24,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Check JST monthly schedule
+        id: jst_gate
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "repository_dispatch" && "$(TZ=Asia/Tokyo date +%d)" != "01" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Not the first day of the month in JST; skipping monthly sweep."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.jst_gate.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.jst_gate.outputs.run == 'true'
         with:
           python-version: "3.12"
           cache: "pip"
 
       - name: Install dependencies
+        if: steps.jst_gate.outputs.run == 'true'
         run: pip install -r requirements.txt
 
       - name: Verify secret
-        if: github.event_name == 'repository_dispatch'
+        if: github.event_name == 'repository_dispatch' && steps.jst_gate.outputs.run == 'true'
         env:
           CRONJOB_SECRET: ${{ secrets.CRONJOB_SECRET }}
         run: |
@@ -45,6 +59,7 @@ jobs:
           fi
 
       - name: Run monthly sweep
+        if: steps.jst_gate.outputs.run == 'true'
         env:
           API_KEY_FOR_ALL_COMMENT_GET:  ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET }}
           API_KEY_FOR_ALL_COMMENT_GET2: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET2 }}

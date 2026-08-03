@@ -3,6 +3,7 @@
 
 実行する処理:
   毎分    : sync_new_comments()        新しく立ったスレッドとその返信を取得
+  毎分    : check_ksk_commands()       ksk(加速)スレッドの登録/解除コマンド検出(YouTube API不使用)
   10分おき : run_reply_recheck_batch()  コールド層(全履歴のカーソル巡回)
   30分おき : 同上 + ホット層(直近24時間のスレッド全件)
 
@@ -35,6 +36,7 @@ dotenv.load_dotenv(Path(__file__).parent.parent / "flaskr" / ".env")
 dotenv.load_dotenv()
 
 import time_comment_common
+import ksk_common
 import account_live_core
 import repair_queue
 from turso_client import TursoClient
@@ -1353,6 +1355,356 @@ def _clear_time_comment_cache(time_key: str) -> None:
 
 
 # ------------------------------------------------------------------ #
+# ksk(加速)スレッドのコマンド検出（T0、毎分同期に便乗）
+#
+# スレ主が `!ksk`(または `/ksk`)を含む親コメントを立てると、そのスレッドが /ksk ページの
+# 追跡対象として登録される（オプトイン）。解除はスレ主本人が自分のスレッドへ
+# `!ksk stop` と返信する。
+#
+# YouTube API は一切叩かない — 直近 DETECT_WINDOW_MIN 分の comments を
+# idx_comments_published 経由で読むだけ。窓を毎分丸ごと再スキャンするのは、
+# YouTube側のコメント反映に数分の遅延があり得るため（check_time_comments と同じ理由）。
+# 登録は thread_id の PK 冪等なので、同じ窓を何度見ても副作用はない。
+#
+# 解除コマンドは返信として打たれるため sync_new_comments() では拾えない（あちらは
+# 新規スレッドしか見ない）。この窓スキャンは親・返信を区別せず読むので、返信の
+# 解除コマンドもここで 1分以内に検知できる（追加の読み取りコストはゼロ）。
+# ------------------------------------------------------------------ #
+
+def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
+    """直近の窓から ksk コマンドを検出して登録・解除する。戻り値は状態が変わった件数。"""
+    start_epoch, end_epoch = ksk_common.detect_window_bounds(now_epoch)
+    rows = client.query(
+        "SELECT comment_id, parent_id, author_channel_id, handle, published_at, text "
+        "FROM comments WHERE published_at >= ? AND published_at < ? ORDER BY published_at",
+        [start_epoch, end_epoch],
+    )
+    if not rows:
+        return 0
+
+    # コマンドを含む行が1件も無ければ、ここで打ち切って以降のクエリを一切投げない
+    # （通常はこの分岐に入る。ksk は稀なイベントなので毎分の実コストはこの1クエリだけ）。
+    candidates = []
+    for row in rows:
+        cmd = ksk_common.parse_command(row.get("text"))
+        if cmd is not None:
+            candidates.append((row, cmd))
+    if not candidates:
+        return 0
+
+    ksk_common.ensure_schema(client)
+    active = ksk_common.get_threads_by_state(client, ksk_common.STATE_ACTIVE)
+    active_by_id = {t["thread_id"]: t for t in active}
+    active_owners = {t["owner_channel_id"] for t in active}
+    active_count = len(active)
+
+    # 既に登録済み（active/ended どちらでも）の thread_id は上限判定をやり直さない。
+    thread_ids = [r["comment_id"] for r, c in candidates
+                  if r.get("parent_id") is None and c["action"] == ksk_common.ACTION_START]
+    known_ids: set[str] = set()
+    if thread_ids:
+        placeholders = ",".join("?" for _ in thread_ids)
+        known_ids = {
+            r["thread_id"] for r in client.query(
+                f"SELECT thread_id FROM ksk_threads WHERE thread_id IN ({placeholders})",
+                thread_ids,
+            )
+        }
+
+    banned = ksk_common.get_banned_channels(client) if thread_ids else set()
+    day_start = ksk_common.jst_day_start_epoch(now_epoch)
+    changed = 0
+
+    for row, cmd in candidates:
+        is_thread = row.get("parent_id") is None
+        author = row.get("author_channel_id")
+
+        if cmd["action"] == ksk_common.ACTION_STOP:
+            # 解除はスレ主本人が自分の active スレッドに返信した場合のみ
+            if is_thread:
+                continue
+            thread = active_by_id.get(row.get("parent_id"))
+            if thread is None or thread["owner_channel_id"] != author:
+                continue
+            ksk_common.end_thread(client, thread["thread_id"], ksk_common.REASON_STOPPED, now_epoch)
+            active_by_id.pop(thread["thread_id"], None)
+            active_owners.discard(thread["owner_channel_id"])
+            active_count -= 1
+            changed += 1
+            print(f"  ksk 解除: {thread['thread_id']}", flush=True)
+            continue
+
+        # 登録コマンドは親コメント本文にしか置けない。返信として打たれた `!ksk` を
+        # 登録に使うと、既存スレッドへの返信を拾う経路が30分おきの巡回チェックしか
+        # 無いため最大30分検知できず、仕様として成立しない。
+        if not is_thread or not author:
+            continue
+        thread_id = row["comment_id"]
+        if thread_id in known_ids:
+            continue
+        if author in banned:
+            print(f"  ksk 登録拒否(BAN): {thread_id}", flush=True)
+            continue
+        if active_count >= ksk_common.MAX_ACTIVE_THREADS:
+            print(f"  ksk 登録拒否(同時上限{ksk_common.MAX_ACTIVE_THREADS}本): {thread_id}", flush=True)
+            continue
+        if author in active_owners:
+            print(f"  ksk 登録拒否(このアカウントは稼働中): {thread_id}", flush=True)
+            continue
+        if ksk_common.count_registrations_since(client, author, day_start) >= ksk_common.MAX_REGISTRATIONS_PER_DAY:
+            print(f"  ksk 登録拒否(1日{ksk_common.MAX_REGISTRATIONS_PER_DAY}回まで): {thread_id}", flush=True)
+            continue
+
+        ksk_common.register_thread(
+            client, thread_id, author, row.get("handle"), cmd.get("title"),
+            int(row["published_at"]), now_epoch,
+        )
+        known_ids.add(thread_id)
+        active_owners.add(author)
+        active_count += 1
+        changed += 1
+        print(f"  ksk 登録: {thread_id} title={cmd.get('title')!r}", flush=True)
+
+    if changed:
+        _write_ksk_index(client, now_epoch)
+    return changed
+
+
+def _write_ksk_index(client: TursoClient, now_epoch: int) -> None:
+    """一覧ページ用の1行インデックスを作り直す(状態が変わったときだけ呼ぶ)。"""
+    threads = ksk_common.get_threads_by_state(client, ksk_common.STATE_ACTIVE)
+    threads += ksk_common.get_recent_threads(client, limit=ksk_common.INDEX_PAST_LIMIT)
+    ksk_common.write_index(client, ksk_common.build_index_payload(threads, now_epoch), now_epoch)
+
+
+# ------------------------------------------------------------------ #
+# ksk 追跡（T1: 速度 / T2: 内訳）
+#
+# T1: active スレッドがある分だけ Pass1(commentThreads.list(id=))を1回投げ、
+#     totalReplyCount を取る。50件までなら1 unit なので、稼働中でも 1 unit/分。
+# T2: 返信本体を取得して Turso へ UPSERT し、集計SQLで payload を作る。
+#     実行間隔は返信数に比例(ksk_common.pass2_interval_min)。
+#
+# 専用APIキー: 本体同期と同じキープールを使うと、加速中(=コメント急増中で本体同期も
+# 普段より多くリクエストを投げている)にコアのクォータを食い、新着同期そのものを
+# 止めかねない。ksk は API_KEY_FOR_KSK だけを使う独立クライアントで動かす。
+# monthly_sweep.py のように configure_api_keys() でグローバルのキープールを差し替える
+# 手は使えない — あちらは専用エントリポイントで単独プロセスだが、ksk は本体同期と
+# 同じプロセス内に同居するため、差し替えると本体同期のローテーションを壊す。
+# ------------------------------------------------------------------ #
+
+KSK_API_KEY = os.getenv("API_KEY_FOR_KSK", "").strip()
+KSK_TIME_BUDGET_SEC = 25  # main() 開始からこの秒数を超えたら ksk の追跡を打ち切る
+
+_ksk_youtube = None
+
+
+def _get_ksk_youtube():
+    global _ksk_youtube
+    if not KSK_API_KEY:
+        return None
+    if _ksk_youtube is None:
+        _ksk_youtube = build("youtube", "v3", developerKey=KSK_API_KEY, cache_discovery=False)
+    return _ksk_youtube
+
+
+def _ksk_pass1(youtube, thread_ids: list[str]) -> tuple[set, dict, bool]:
+    """ksk 用 Pass1。戻り値: (生存スレッドID, {ID: totalReplyCount}, 完走したか)。
+
+    _pass1_reply_counts() を流用しないのは、あちらが _handle_api_error() 経由で
+    **本体同期のキープール**をローテーションしてしまうため。ksk は単一の専用キーで動くので
+    ローテーションは行わず、失敗したらこの分は諦めて次の分に任せる(状態を持たないので
+    リトライは自動的に成立する)。
+    """
+    alive: set[str] = set()
+    counts: dict[str, int] = {}
+    for i in range(0, len(thread_ids), RECHECK_ID_CHUNK):
+        chunk = thread_ids[i:i + RECHECK_ID_CHUNK]
+        try:
+            resp = youtube.commentThreads().list(
+                part="snippet", id=",".join(chunk), textFormat="plainText", maxResults=50,
+            ).execute()
+        except HttpError as e:
+            print(f"  ksk Pass1 失敗: {e}", flush=True)
+            return alive, counts, False
+        if resp.get("nextPageToken"):
+            # 渡したIDが1回で返り切っていない = 「返ってこなかった=削除」判定が成立しない。
+            # 生きているスレッドを誤って終了させないため中断する(_MAX_DEAD_RATIO と同じ思想)。
+            print("  ksk Pass1 のレスポンスが分割されている。削除誤検知を避けるため中断", flush=True)
+            return alive, counts, False
+        for item in resp.get("items", []):
+            alive.add(item["id"])
+            counts[item["id"]] = item["snippet"].get("totalReplyCount", 0)
+    return alive, counts, True
+
+
+def _ksk_fetch_reply_pages(youtube, thread_id: str, start_token):
+    """返信を取得する。戻り値: (items, 最後のページを取ったトークン, 消費units)。
+
+    最後のページを**取得したときのトークン**を返すのがポイント。最終ページには
+    nextPageToken が無いので「続きから」のトークンは存在しない。代わりに最終ページの
+    トークンを保存しておき、次回はそこから取り直す — 新しい返信は最終ページに
+    追記されるので、そのページを取り直せば差分が入っている。
+    """
+    token = start_token
+    items = []
+    last_page_token = None
+    units = 0
+    for _ in range(ksk_common.MAX_REPLY_PAGES):
+        resp = youtube.comments().list(
+            part="snippet", parentId=thread_id, maxResults=100,
+            pageToken=token, textFormat="plainText",
+        ).execute()
+        units += 1
+        last_page_token = token
+        items.extend(resp.get("items", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return items, last_page_token, units
+
+
+def _ksk_sync_replies(client: TursoClient, youtube, thread: dict, now_epoch: int):
+    """ksk 用 Pass2。**削除検知は一切行わない**(upsert のみ)。
+
+    _resync_thread_replies() を流用してはいけない — あちらは「今回返ってこなかった
+    既知返信 = 削除」として is_deleted=1 を打つ。連投バースト中の YouTube API は
+    結果整合で一時的に返信を落とすことがあり、これを高頻度で実行すると本番 comments
+    (2.1M行)に大量の偽削除が入って自動では戻せない。削除検知は従来の30分 recheck に任せる。
+
+    戻り値: (新規に書いた返信数, 次回用トークン, 消費units)
+    """
+    tid = thread["thread_id"]
+    known = ksk_common.known_reply_ids(client, tid)
+    token = thread.get("resume_token")
+
+    items, last_token, units = _ksk_fetch_reply_pages(youtube, tid, token)
+    if token and items and not any(it["id"] in known for it in items):
+        # 保存トークンが指す位置がズレた(YouTube の pageToken はリストが変化すると
+        # 位置を保証しない)。既知IDと1件も重ならないなら信用できないので捨てて取り直す。
+        print(f"  ksk: resume_token がズレたためフル再取得 {tid}", flush=True)
+        items, last_token, extra = _ksk_fetch_reply_pages(youtube, tid, None)
+        units += extra
+
+    thread_pub = int(thread["started_at"])
+    order = len(known) + 1
+    rows = []
+    for it in items:
+        if it["id"] in known:
+            continue
+        rs = it["snippet"]
+        deleted = is_deleted_sentinel(rs)
+        rows.append({
+            "comment_id": it["id"],
+            "parent_id": tid,
+            "reply_order": order,
+            "thread_published_at": thread_pub,
+            "author_channel_id": rs.get("authorChannelId", {}).get("value"),
+            "handle": rs.get("authorDisplayName") if not deleted else None,
+            "text": rs.get("textDisplay") if not deleted else None,
+            "original_text": None,
+            "published_at": parse_epoch(rs["publishedAt"]),
+            "like_count": None if deleted else int(rs.get("likeCount", 0)),
+            "is_pinned": 0,
+            "is_deleted": 1 if deleted else 0,
+            "deleted_confirmed_at": now_epoch if deleted else None,
+            "fetched_at": now_epoch,
+        })
+        known.add(it["id"])
+        order += 1
+
+    # 差分だけ書く。値が変わらない行まで UPSERT すると ON CONFLICT DO UPDATE が
+    # 行を書き換えて rows_written に計上される(1000件×毎分で日次予算の36%)。
+    upsert_rows(client, rows)
+    return len(rows), last_token, units
+
+
+def _ksk_refresh_stats(client: TursoClient, thread: dict, reply_count: int, now_epoch: int) -> int:
+    """集計SQLを回して ksk_thread_stats を書き、参加アカウント数を返す。"""
+    tid = thread["thread_id"]
+    q1, q2, gaps, medians = ksk_common.aggregate_thread(client, tid)
+    payload = ksk_common.build_payload(
+        thread, q1, q2, gaps, medians,
+        total_reply_count=reply_count, now_epoch=now_epoch,
+    )
+    ksk_common.write_thread_stats(client, tid, payload, now_epoch)
+    return len(q1)
+
+
+def run_ksk_tracking(client: TursoClient, now_epoch: int, deadline: float) -> int:
+    """active な ksk スレッドの速度と内訳を更新する。戻り値は状態が変わった件数。"""
+    active = ksk_common.get_threads_by_state(client, ksk_common.STATE_ACTIVE)
+    if not active:
+        return 0
+
+    youtube = _get_ksk_youtube()
+    if youtube is None:
+        print("  ksk: API_KEY_FOR_KSK 未設定のため追跡をスキップ", flush=True)
+        return 0
+
+    quota = ksk_common.read_quota_state(client, now_epoch)
+    if quota["units_used"] >= ksk_common.DAILY_UNIT_BUDGET:
+        for t in active:
+            ksk_common.end_thread(client, t["thread_id"], ksk_common.REASON_BUDGET, now_epoch)
+        _write_ksk_index(client, now_epoch)
+        print(f"  ksk: 日次unit予算({ksk_common.DAILY_UNIT_BUDGET})に到達、追跡終了", flush=True)
+        return len(active)
+
+    alive, counts, ok = _ksk_pass1(youtube, [t["thread_id"] for t in active])
+    units = 1
+    if not ok:
+        ksk_common.write_quota_state(client, now_epoch, quota["units_used"] + units)
+        return 0
+
+    changed = 0
+    for thread in active:
+        tid = thread["thread_id"]
+        if tid not in alive:
+            ksk_common.end_thread(client, tid, ksk_common.REASON_DELETED, now_epoch)
+            changed += 1
+            continue
+
+        reply_count = int(counts.get(tid, 0))
+        prev_count = int(thread.get("last_reply_count") or 0)
+        grew = reply_count > prev_count
+        # 終了判定は更新前の行(last_growth_at)を見る必要があるので、書き戻しより先に行う
+        reason = ksk_common.evaluate_end_reason(thread, reply_count, now_epoch)
+        ksk_common.update_pass1_progress(client, tid, reply_count, now_epoch, grew)
+        if grew:
+            changed += 1
+
+        # 誰も乗らなかった `!ksk` に返信取得のコストを払わない。
+        # 終了するスレッドは、最後の状態を残すため間隔を無視して1回だけ回す。
+        should_pass2 = (
+            reply_count >= ksk_common.MIN_REPLIES_FOR_TRACKING
+            and (reason is not None or ksk_common.pass2_due(thread, reply_count, now_epoch))
+            and time.monotonic() < deadline
+        )
+        if should_pass2:
+            n_new, last_token, used = _ksk_sync_replies(client, youtube, thread, now_epoch)
+            units += used
+            snapshot = dict(thread)
+            snapshot["last_reply_count"] = reply_count
+            if reason is not None:
+                snapshot["state"] = ksk_common.STATE_ENDED
+                snapshot["ended_at"] = now_epoch
+                snapshot["ended_reason"] = reason
+            n_accounts = _ksk_refresh_stats(client, snapshot, reply_count, now_epoch)
+            ksk_common.update_pass2_progress(client, tid, last_token, n_accounts, now_epoch)
+            print(f"  ksk 更新: {tid} 返信{reply_count}件(+{n_new}) {n_accounts}アカウント", flush=True)
+
+        if reason is not None:
+            ksk_common.end_thread(client, tid, reason, now_epoch)
+            changed += 1
+            print(f"  ksk 終了: {tid} 理由={reason}", flush=True)
+
+    ksk_common.write_quota_state(client, now_epoch, quota["units_used"] + units)
+    if changed:
+        _write_ksk_index(client, now_epoch)
+    return changed
+
+
+# ------------------------------------------------------------------ #
 # エントリポイント
 # ------------------------------------------------------------------ #
 
@@ -1380,6 +1732,7 @@ def main():
 
     wait_until_next_minute()
 
+    run_started_at = time.monotonic()
     now = datetime.now(timezone.utc)
     print(f"[{now.strftime('%H:%M:%S')} UTC] 同期開始")
 
@@ -1394,6 +1747,27 @@ def main():
         written_time_keys = set()
     for time_key in written_time_keys:
         _clear_time_comment_cache(time_key)
+
+    # ksk(加速)の検出と追跡。try/exceptで包むのはcheck_time_comments()と同じ理由 —
+    # この処理の失敗が、既に成功している新着同期や、この後の巡回チェックを
+    # 巻き添えにしてはいけない。
+    #
+    # 実行時間バジェット: 1000返信のPass2は逐次HTTP10回になり得る。毎分ジョブが60秒を
+    # 超えると concurrency group により次の分の実行が待たされ、新着同期そのものが遅れる。
+    # main()開始からの経過を見て、超過していたら追跡を打ち切る(次の分に持ち越すだけ)。
+    ksk_deadline = run_started_at + KSK_TIME_BUDGET_SEC
+    try:
+        n_ksk = check_ksk_commands(client, int(now.timestamp()))
+        if n_ksk:
+            print(f"  ksk 状態変化: {n_ksk} 件")
+    except Exception as e:
+        print(f"  kskコマンド検出エラー: {e}", flush=True)
+    try:
+        n_track = run_ksk_tracking(client, int(now.timestamp()), ksk_deadline)
+        if n_track:
+            print(f"  ksk 追跡更新: {n_track} 件")
+    except Exception as e:
+        print(f"  ksk追跡エラー: {e}", flush=True)
 
     # 10分おき: コールド層(全履歴のカーソル巡回)だけ
     # 30分おき: それに加えてホット層(直近24時間のスレッド全件)も見る

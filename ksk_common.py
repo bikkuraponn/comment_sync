@@ -291,86 +291,41 @@ def evaluate_end_reason(thread: dict, reply_count: int, now_epoch: int) -> str |
 
 
 # ------------------------------------------------------------------ #
-# 集計SQL（T2 用。返る行数を十数行〜数百行に落とすため Turso 側で GROUP BY する）
+# 集計（T2 用）
 #
-# rows_read 自体は Python 側で全返信を舐めても同じ(どちらも idx_parent_published で
-# そのスレッドの返信範囲を SEARCH する)。SQL にすると返る行数だけが減るので、転送量と
-# ランナー実行時間が減る。さらに毎回 Turso の実データから引き直すため、resume_token に
-# よる差分取得と組み合わせても内訳が構造的に自己修復する(Python 側の累積器だと削除・
-# 取りこぼし・再起動でズレたまま直らない)。
+# **そのスレッドの返信の生データを1回だけ引き、集計は全部 Python で行う。**
 #
-# 本番投入前に4本とも EXPLAIN QUERY PLAN で idx_parent_published の SEARCH になって
-# いることを確認すること。特に Q2 の `published_at / 60` と Q3 のウィンドウ関数で
-# 索引が外れて SCAN に落ちていないか。
+# 以前は Turso 側で GROUP BY させる設計で、件数(Q1)・分バケット(Q2)・間隔サマリ(Q3)・
+# 中央値(上位8アカウント各1本)の計12本のクエリを投げていた。返る行数は確かに小さく
+# なるが、**課金されるのは返る行数ではなくスキャンされる行数(rows_read)**であり、
+# どのクエリも `WHERE parent_id = ?` でそのスレッドの返信を頭から舐め直すため、
+# 1000返信のスレッドで 12 × 1000 = 約12,000 rows_read/回になっていた。
+#
+# 生データを1回引けば 1 × 1000 行で済み、しかも中央値を**全アカウント分**出せる
+# (以前は上位8件に限定していた。複数アカウントを使った連投を見るのが目的なので、
+# 2〜8番手の間隔を捨てるのは本末転倒だった)。集計先は GitHub Actions ランナーで
+# CPU 課金が無いので、Python 側で回してもコスト上のデメリットは無い。
+#
+# 「集計は SQL に寄せる」という判断が正しいのは **Vercel**(Active CPU 課金あり)の
+# 話であって、ランナー上のバッチには当てはまらない。取り違えないこと。
+#
+# ORDER BY published_at は idx_parent_published (parent_id, published_at) の索引順
+# そのものなので追加ソートは発生しない(EXPLAIN QUERY PLAN で SEARCH のみを確認済み)。
+#
+# 【索引の罠・記録】このクエリに `author_channel_id` の条件を足してはいけない。
+# 足すと SQLite が idx_parent_published ではなく idx_comments_author_published を
+# 選び、「このスレッドの返信」ではなく「そのアカウントの全履歴コメント」を舐める
+# 形になる(連投の上位アカウントほど全履歴も多いので最悪ケース。2026-07-06 の
+# 「結果が小さいから軽いと誤判断して2,000万行読んだ」インシデントと同型)。
+# どうしてもアカウントで絞る必要が出たら `+author_channel_id = ?` と書いて
+# 索引使用を抑制する(random_comment.py の `+parent_id IS NULL` と同じ手)。
 # ------------------------------------------------------------------ #
 
-Q1_ACCOUNTS_SQL = """
-SELECT author_channel_id,
-       MAX(handle)       AS handle,
-       COUNT(*)          AS c,
-       MIN(published_at) AS first_at,
-       MAX(published_at) AS last_at
+Q_THREAD_REPLIES_SQL = """
+SELECT author_channel_id, handle, published_at
 FROM comments
 WHERE parent_id = ? AND is_deleted = 0
-GROUP BY author_channel_id
-ORDER BY c DESC
-"""
-
-Q2_MINUTE_BUCKETS_SQL = """
-SELECT published_at / 60 AS m, author_channel_id, COUNT(*) AS c
-FROM comments
-WHERE parent_id = ? AND is_deleted = 0
-GROUP BY m, author_channel_id
-ORDER BY m
-"""
-
-_Q3_GAP_SUBQUERY = """
-SELECT author_channel_id,
-       published_at - LAG(published_at) OVER (
-         PARTITION BY author_channel_id ORDER BY published_at) AS gap
-FROM comments
-WHERE parent_id = ? AND is_deleted = 0
-"""
-
-
-# Q3: 投稿間隔サマリ。**アカウントで絞らず、スレッド全体を1回で GROUP BY する。**
-#
-# 当初は上位アカウントだけを `WHERE author_channel_id IN (...)` で絞る形だったが、
-# EXPLAIN QUERY PLAN で確認したところ SQLite がその条件をサブクエリへ押し込み、
-# idx_parent_published ではなく idx_comments_author_published(author_channel_id=?) を
-# 選んでいた。つまり「このスレッドの返信」ではなく「そのアカウントの全履歴コメント」を
-# 舐める形になる。連投の上位アカウントほど全履歴の投稿数も多いので最悪のケースになる
-# (2026-07-06 の「結果が小さいから軽いと誤判断して2,000万行読んだ」インシデントと同型)。
-#
-# 絞りを外すと索引選択が idx_parent_published に戻り、しかも返る行数は
-# 参加アカウント数(十数行)にしかならないので、1クエリで全アカウント分が取れる。
-# 上位8件の抽出は Python 側で行う。
-#
-# min_gap は NULLIF(gap, 0) で0秒を除外する — published_at は秒精度なので同秒投稿が
-# 普通に起きる。0を「最速0秒」として見せると無限速度に見えるため、0の個数は
-# same_second_pairs という別指標にする。
-Q3_GAP_STATS_SQL = f"""
-SELECT author_channel_id,
-       AVG(gap)                                  AS avg_gap,
-       MIN(NULLIF(gap, 0))                       AS min_gap,
-       SUM(CASE WHEN gap = 0 THEN 1 ELSE 0 END)  AS same_second_pairs,
-       COUNT(gap)                                AS gap_n
-FROM ({_Q3_GAP_SUBQUERY})
-WHERE gap IS NOT NULL
-GROUP BY author_channel_id
-"""
-
-# 中央値。SQLite/libSQL に中央値の集約関数が無いため OFFSET で真ん中の1行を取る。
-# 上位 TOP_ACCOUNTS 件ぶんを query_batch() で1パイプラインにまとめて投げる想定。
-#
-# `+author_channel_id` の `+` は索引使用を抑制する単項演算子(random_comment.py の
-# `+parent_id IS NULL` と同じ手)。これが無いと Q3 と同じく
-# idx_comments_author_published が選ばれ、そのアカウントの全履歴を舐めてしまう。
-Q3_MEDIAN_GAP_SQL = f"""
-SELECT gap FROM ({_Q3_GAP_SUBQUERY})
-WHERE gap IS NOT NULL AND +author_channel_id = ?
-ORDER BY gap
-LIMIT 1 OFFSET ?
+ORDER BY published_at
 """
 
 
@@ -684,38 +639,77 @@ def write_quota_state(turso: TursoClient, now_epoch: int, units_used: int) -> No
 # 集計（T2 の書き込み後に呼ぶ）
 # ------------------------------------------------------------------ #
 
-def aggregate_thread(turso: TursoClient, thread_id: str, top_n: int = TOP_ACCOUNTS):
-    """1スレッドぶんの集計を Turso 側で回す。
+def aggregate_thread(turso: TursoClient, thread_id: str):
+    """1スレッドぶんの集計。**Turso へのクエリはこの1本だけ**(上の注記参照)。
 
     戻り値: (q1_rows, q2_rows, gap_rows, median_gap_by_channel)
     そのまま build_payload() に渡せる。
     """
-    q1_rows = turso.query(Q1_ACCOUNTS_SQL, [thread_id])
-    q2_rows = turso.query(Q2_MINUTE_BUCKETS_SQL, [thread_id])
-    gap_rows = turso.query(Q3_GAP_STATS_SQL, [thread_id])
+    rows = turso.query(Q_THREAD_REPLIES_SQL, [thread_id])
+    return aggregate_rows(rows)
 
-    gap_by_channel = {r["author_channel_id"]: r for r in gap_rows}
-    statements, targets = [], []
-    for r in q1_rows[:top_n]:
-        cid = r["author_channel_id"]
-        g = gap_by_channel.get(cid)
-        n = int(g["gap_n"]) if g and g.get("gap_n") else 0
-        if n <= 0:
-            continue
-        # 昇順に並べた gap の真ん中の1行。偶数個なら小さい側(下位中央値)を採る
-        statements.append({"sql": Q3_MEDIAN_GAP_SQL, "args": [thread_id, cid, (n - 1) // 2]})
-        targets.append(cid)
 
-    # query_batch()(複数SELECTを1パイプラインにまとめる)は turso_client.py の
-    # コピーによって実装の有無が分かれる(flaskr側にはあるが comment_sync側には無い、
-    # 2026-08-03に本番エラーで発覚)。最大 TOP_ACCOUNTS(=8)件の単発 query() ループに
-    # 留め、コピー間の差異に依存しないようにする。Pass2 自体が1〜5分に1回しか
-    # 走らないので、往復が増えるコストは無視できる。
+def aggregate_rows(rows: list[dict]):
+    """返信の生データから集計を作る純関数(Turso 非依存、単体テスト可能)。
+
+    rows: [{"author_channel_id":..., "handle":..., "published_at":...}, ...]
+    戻り値: (q1_rows, q2_rows, gap_rows, median_gap_by_channel)
+
+    中央値は**全アカウント分**出す。以前は上位8件に限っていたが、複数アカウントを
+    使った連投を見るのがこの機能の目的なので、2番手以降の間隔を捨ててはいけない。
+    生データを1回引く方式なら全員分を出しても追加の rows_read はゼロ。
+    """
+    by_account: dict[str, dict] = {}
+    buckets: dict[tuple, int] = {}
+
+    for r in rows:
+        cid = r.get("author_channel_id")
+        ts = int(r["published_at"])
+        entry = by_account.setdefault(cid, {"handle": None, "times": []})
+        if r.get("handle"):
+            entry["handle"] = r["handle"]
+        entry["times"].append(ts)
+        key = (ts // 60, cid)
+        buckets[key] = buckets.get(key, 0) + 1
+
+    q1_rows, gap_rows = [], []
     medians: dict[str, int] = {}
-    for stmt, cid in zip(statements, targets):
-        rows = turso.query(stmt["sql"], stmt["args"])
-        if rows and rows[0].get("gap") is not None:
-            medians[cid] = int(rows[0]["gap"])
+
+    for cid, entry in by_account.items():
+        # 呼び出し元は published_at 昇順で渡す想定だが、順序に依存しないよう明示的に
+        # ソートする(間隔の計算は順序が狂うと負の値になる)
+        times = sorted(entry["times"])
+        q1_rows.append({
+            "author_channel_id": cid,
+            "handle": entry["handle"],
+            "c": len(times),
+            "first_at": times[0],
+            "last_at": times[-1],
+        })
+
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        if not gaps:
+            continue
+        nonzero = [g for g in gaps if g > 0]
+        gap_rows.append({
+            "author_channel_id": cid,
+            "avg_gap": sum(gaps) / len(gaps),
+            # published_at は秒精度なので同秒投稿が普通に起きる。0を「最速0秒」として
+            # 見せると無限速度に見えるため除外し、0の個数は別指標にする。
+            "min_gap": min(nonzero) if nonzero else None,
+            "same_second_pairs": sum(1 for g in gaps if g == 0),
+            "gap_n": len(gaps),
+        })
+        ordered = sorted(gaps)
+        # 偶数個なら小さい側(下位中央値)。旧SQLの LIMIT 1 OFFSET (n-1)//2 と同じ規約
+        medians[cid] = ordered[(len(ordered) - 1) // 2]
+
+    # 件数降順。同数はチャンネルIDで安定させる(表示順が実行ごとにぶれないように)
+    q1_rows.sort(key=lambda r: (-r["c"], r["author_channel_id"] or ""))
+    q2_rows = [
+        {"m": m, "author_channel_id": cid, "c": n}
+        for (m, cid), n in sorted(buckets.items(), key=lambda kv: (kv[0][0], kv[0][1] or ""))
+    ]
     return q1_rows, q2_rows, gap_rows, medians
 
 

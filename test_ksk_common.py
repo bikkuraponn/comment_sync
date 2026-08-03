@@ -262,85 +262,124 @@ class SqlShapeTest(unittest.TestCase):
     「なぜその書き方なのか」が失われないよう形だけを守る。
     """
 
-    def test_gap_stats_takes_only_parent_id(self):
-        # author_channel_id で絞ると idx_comments_author_published が選ばれ、
-        # そのアカウントの全履歴を舐めてしまう(モジュール内コメント参照)
-        self.assertEqual(K.Q3_GAP_STATS_SQL.count("?"), 1)
-        self.assertNotIn("author_channel_id IN", K.Q3_GAP_STATS_SQL)
+    def test_thread_replies_query_takes_only_parent_id(self):
+        # author_channel_id を条件に足すと idx_comments_author_published が選ばれ、
+        # 「このスレッドの返信」ではなく「そのアカウントの全履歴」を舐めてしまう
+        # (ksk_common の集計セクションの注記参照)
+        self.assertEqual(K.Q_THREAD_REPLIES_SQL.count("?"), 1)
+        self.assertIn("parent_id = ?", K.Q_THREAD_REPLIES_SQL)
+        self.assertNotIn("author_channel_id =", K.Q_THREAD_REPLIES_SQL)
+        self.assertNotIn("author_channel_id IN", K.Q_THREAD_REPLIES_SQL)
 
-    def test_min_gap_excludes_same_second(self):
-        self.assertIn("NULLIF(gap, 0)", K.Q3_GAP_STATS_SQL)
-
-    def test_median_sql_suppresses_author_index(self):
-        # `+` を落とすと idx_comments_author_published に切り替わる
-        self.assertIn("+author_channel_id = ?", K.Q3_MEDIAN_GAP_SQL)
-        self.assertIn("LIMIT 1 OFFSET ?", K.Q3_MEDIAN_GAP_SQL)
+    def test_thread_replies_query_orders_by_index_column(self):
+        # idx_parent_published (parent_id, published_at) の索引順そのものなので
+        # 追加ソートが発生しない。別の列で並べ替えると TEMP B-TREE が入る
+        self.assertIn("ORDER BY published_at", K.Q_THREAD_REPLIES_SQL)
 
 
-class _NoQueryBatchTurso:
-    """query_batch() を持たない偽Turso。
+class _CountingTurso:
+    """query() の呼び出し回数を数える偽Turso。
 
-    2026-08-03、本番で 'TursoClient' object has no attribute 'query_batch' が
-    発生した(comment_sync/turso_client.py のコピーには query_batch() が無いのに
-    aggregate_thread() がそれを呼んでいた — turso_client.py は複数コピー間で
-    手動同期のため、flaskr側にあるからと言って comment_sync側にもあるとは限らない)。
-    このクラスはあえて query_batch を実装しない = 呼んだ瞬間 AttributeError で
-    落ちるので、aggregate_thread() が query_batch に依存しなくなったことを固定する。
-
-    Q1/Q3本体はどちらも "SELECT author_channel_id," で始まり先頭一致では
-    区別できないため、各クエリに固有の部分文字列でルーティングする。
+    aggregate_thread() が **スレッドあたり1クエリ** に収まっていることを固定する。
+    以前は Q1/Q2/Q3 + 中央値×8 の計12本を投げており、どれも
+    `WHERE parent_id = ?` でスレッド全体を舐め直すため、1000返信のスレッドで
+    約12,000 rows_read/回になっていた(2026-08-03のレビューで発覚)。
+    課金されるのは返る行数ではなくスキャン行数なので、クエリ本数がそのまま効く。
     """
 
-    def __init__(self, responses):
-        self._responses = responses  # [(distinguishing substring, rows|callable), ...]
+    def __init__(self, rows):
+        self._rows = rows
         self.calls = []
 
     def query(self, sql, args=None):
         self.calls.append((sql, args))
-        for marker, rows in self._responses:
-            if marker in sql:
-                return rows(args) if callable(rows) else rows
-        return []
+        return self._rows
+
+
+def _reply(cid, ts, handle=None):
+    return {"author_channel_id": cid, "handle": handle or ("@" + cid), "published_at": ts}
 
 
 class AggregateThreadTest(unittest.TestCase):
-    def test_does_not_require_query_batch(self):
-        gap_row = {"author_channel_id": "UC_a", "gap_n": 3}
+    def test_issues_exactly_one_query(self):
+        turso = _CountingTurso([_reply("UC_a", 100), _reply("UC_a", 110)])
+        K.aggregate_thread(turso, "Ugy_test")
+        self.assertEqual(len(turso.calls), 1, "スレッドあたり1クエリに収めること")
+        self.assertEqual(turso.calls[0][1], ["Ugy_test"])
 
-        def median_rows(args):
-            # args = [thread_id, channel_id, offset]
-            self.assertEqual(args[1], "UC_a")
-            return [{"gap": 7}]
 
-        turso = _NoQueryBatchTurso([
-            ("ORDER BY c DESC",
-             [{"author_channel_id": "UC_a", "handle": "@a", "c": 5,
-               "first_at": 1, "last_at": 2}]),
-            ("published_at / 60", []),
-            ("AVG(gap)", [gap_row]),
-            ("LIMIT 1 OFFSET", median_rows),
+class AggregateRowsTest(unittest.TestCase):
+    def test_counts_and_first_last(self):
+        q1, _q2, _gaps, _medians = K.aggregate_rows([
+            _reply("UC_a", 100), _reply("UC_b", 105), _reply("UC_a", 130),
         ])
+        by_cid = {r["author_channel_id"]: r for r in q1}
+        self.assertEqual(by_cid["UC_a"]["c"], 2)
+        self.assertEqual(by_cid["UC_a"]["first_at"], 100)
+        self.assertEqual(by_cid["UC_a"]["last_at"], 130)
+        self.assertEqual(by_cid["UC_b"]["c"], 1)
 
-        q1, q2, gaps, medians = K.aggregate_thread(turso, "Ugy_test")
-
-        self.assertEqual(medians, {"UC_a": 7})
-        self.assertFalse(hasattr(turso, "query_batch"))
-
-    def test_skips_median_lookup_when_no_gap_data(self):
-        # gap_n が無い(=まだ2投稿していない)アカウントは median クエリ自体を投げない
-        turso = _NoQueryBatchTurso([
-            ("ORDER BY c DESC",
-             [{"author_channel_id": "UC_a", "handle": "@a", "c": 1,
-               "first_at": 1, "last_at": 1}]),
-            ("published_at / 60", []),
-            ("AVG(gap)", []),
+    def test_sorted_by_count_desc(self):
+        q1, _q2, _gaps, _medians = K.aggregate_rows([
+            _reply("UC_a", 100), _reply("UC_b", 101), _reply("UC_b", 102),
         ])
+        self.assertEqual([r["author_channel_id"] for r in q1], ["UC_b", "UC_a"])
 
-        _q1, _q2, _gaps, medians = K.aggregate_thread(turso, "Ugy_test")
+    def test_gap_stats(self):
+        # 間隔: 10, 0, 20 → 平均10, 最速(0除く)10, 同秒1組
+        _q1, _q2, gaps, medians = K.aggregate_rows([
+            _reply("UC_a", 100), _reply("UC_a", 110),
+            _reply("UC_a", 110), _reply("UC_a", 130),
+        ])
+        g = gaps[0]
+        self.assertEqual(g["gap_n"], 3)
+        self.assertEqual(g["min_gap"], 10)
+        self.assertEqual(g["same_second_pairs"], 1)
+        self.assertAlmostEqual(g["avg_gap"], 10.0)
+        # ソート済み [0,10,20] の下位中央値 = 10
+        self.assertEqual(medians["UC_a"], 10)
 
+    def test_median_is_computed_for_every_account_not_just_top(self):
+        # 複数アカウントでの連投を見るのが目的なので、2番手以降も必ず出す
+        rows = []
+        for i in range(12):
+            cid = f"UC_{i:02d}"
+            # 上位ほど投稿数が多くなるようにする
+            for k in range(12 - i + 1):
+                rows.append(_reply(cid, 1000 + k * 5))
+        _q1, _q2, _gaps, medians = K.aggregate_rows(rows)
+        self.assertEqual(len(medians), 12, "全アカウント分の中央値が出ること")
+
+    def test_all_same_second_leaves_min_gap_none(self):
+        _q1, _q2, gaps, medians = K.aggregate_rows([
+            _reply("UC_a", 100), _reply("UC_a", 100), _reply("UC_a", 100),
+        ])
+        self.assertIsNone(gaps[0]["min_gap"])
+        self.assertEqual(gaps[0]["same_second_pairs"], 2)
+        self.assertEqual(medians["UC_a"], 0)
+
+    def test_single_post_account_has_no_gap_row(self):
+        _q1, _q2, gaps, medians = K.aggregate_rows([_reply("UC_a", 100)])
+        self.assertEqual(gaps, [])
         self.assertEqual(medians, {})
-        median_calls = [c for c in turso.calls if "LIMIT 1 OFFSET" in c[0]]
-        self.assertEqual(median_calls, [])
+
+    def test_minute_buckets(self):
+        _q1, q2, _gaps, _medians = K.aggregate_rows([
+            _reply("UC_a", 600), _reply("UC_a", 630), _reply("UC_b", 660),
+        ])
+        self.assertIn({"m": 10, "author_channel_id": "UC_a", "c": 2}, q2)
+        self.assertIn({"m": 11, "author_channel_id": "UC_b", "c": 1}, q2)
+
+    def test_unsorted_input_does_not_produce_negative_gaps(self):
+        _q1, _q2, gaps, _medians = K.aggregate_rows([
+            _reply("UC_a", 130), _reply("UC_a", 100), _reply("UC_a", 110),
+        ])
+        self.assertEqual(gaps[0]["min_gap"], 10)
+        self.assertGreater(gaps[0]["avg_gap"], 0)
+
+    def test_empty(self):
+        q1, q2, gaps, medians = K.aggregate_rows([])
+        self.assertEqual((q1, q2, gaps, medians), ([], [], [], {}))
 
 
 if __name__ == "__main__":

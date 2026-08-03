@@ -442,5 +442,81 @@ class KskCommandRegistrationTests(unittest.TestCase):
         self.assertEqual(len(active), ksk_common.MAX_ACTIVE_THREADS)
 
 
+class KskDeadRatioTrackingTest(unittest.TestCase):
+    """run_ksk_tracking() が Pass1 の消滅判定に安全弁を持つことを固定する(2026-08-03追加)。
+
+    _ksk_pass1 は本体同期の _pass1_reply_counts と違い _MAX_DEAD_RATIO 相当の
+    保険を持たない。commentThreads.list(id=) が正常応答(nextPageTokenも無し)でも、
+    依頼したIDの一部が理由不明で欠けることがあり、それをそのまま信用すると
+    生きているスレッドを ended(deleted) にしてしまう — 一度 ended にすると
+    同じ comment_id は二度と再登録できないため、実害が大きい。
+    """
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, published_at INTEGER, "
+            "like_count INTEGER, is_pinned INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, "
+            "deleted_confirmed_at INTEGER, fetched_at INTEGER, reply_order INTEGER, "
+            "thread_published_at INTEGER, original_text TEXT, text TEXT)"
+        )
+        ksk_common.ensure_schema(self.client)
+
+    def _register(self, thread_id, owner):
+        ksk_common.register_thread(
+            self.client, thread_id, owner, "@x", None, 1_000_000, 1_000_000,
+        )
+
+    def _states(self):
+        rows = self.client.query("SELECT thread_id, state FROM ksk_threads")
+        return {r["thread_id"]: r["state"] for r in rows}
+
+    def _run(self, alive_ids, counts):
+        # deadline=0 で should_pass2 を常に False にし、Pass2(HTTP呼び出しが必要)を
+        # 経由せずに Pass1 の削除判定ロジックだけを検証する。
+        with patch.object(sync, "_get_ksk_youtube", return_value=object()), \
+             patch.object(sync, "_ksk_pass1", return_value=(set(alive_ids), counts, True)):
+            return sync.run_ksk_tracking(self.client, 1_000_100, deadline=0)
+
+    def test_high_dead_ratio_skips_deletion(self):
+        n = ksk_common.KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD + 3
+        ids = [f"Ugy_{i}" for i in range(n)]
+        for tid in ids:
+            self._register(tid, owner=tid)  # 1アカウント1スレッド上限を回避するため別アカウント
+
+        # 応答に1件しか含まれない(ほぼ全滅) = 異常値として削除判定をスキップすべき
+        self._run(alive_ids=[ids[0]], counts={ids[0]: 5})
+
+        states = self._states()
+        for tid in ids[1:]:
+            self.assertEqual(states[tid], "active", f"{tid} は削除判定されないはず")
+
+    def test_low_dead_ratio_still_marks_deleted(self):
+        n = ksk_common.KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD + 3
+        ids = [f"Ugy_{i}" for i in range(n)]
+        for tid in ids:
+            self._register(tid, owner=tid)
+
+        # 1件だけ本当に消えた(正常な削除検知) = 従来どおり削除マーキングする
+        self._run(alive_ids=ids[1:], counts={tid: 5 for tid in ids[1:]})
+
+        self.assertEqual(self._states()[ids[0]], "ended")
+
+    def test_small_batch_is_not_ratio_guarded(self):
+        # KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD 未満では比率判定自体が無意味なので、
+        # 全滅でも従来どおり削除マーキングする(直接のsignalを信用する)
+        ids = ["Ugy_a", "Ugy_b"]
+        for tid in ids:
+            self._register(tid, owner=tid)
+
+        self._run(alive_ids=[], counts={})
+
+        states = self._states()
+        self.assertEqual(states["Ugy_a"], "ended")
+        self.assertEqual(states["Ugy_b"], "ended")
+
+
 if __name__ == "__main__":
     unittest.main()

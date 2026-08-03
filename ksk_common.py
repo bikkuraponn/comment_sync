@@ -93,6 +93,13 @@ DAILY_UNIT_BUDGET = 8000
 # 想定外の応答で無限ループしないための安全弁(sync.py の MAX_PAGES と同じ考え方)。
 MAX_REPLY_PAGES = 15
 
+# Pass1 で「リクエストした thread_id が応答に含まれなかった = 削除された」と
+# 判定する際の誤検知対策(sync.py の _MAX_DEAD_RATIO/_MIN_BATCH_FOR_DEAD_RATIO_GUARD
+# と同じ思想)。ksk の同時稼働数は MAX_ACTIVE_THREADS(=20)止まりで、本体同期の
+# 巡回チェック(50件単位)より一桁小さいため、フロアも合わせて下げる。
+KSK_MAX_DEAD_RATIO = 0.5
+KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD = 5
+
 # payload に個別に載せるアカウント数。残りは "others" に畳む
 # (円グラフのスライス数と payload サイズの両方の都合)。
 TOP_ACCOUNTS = 8
@@ -604,6 +611,20 @@ def pass2_interval_min(reply_count: int) -> int:
     """
     pages = max(1, math.ceil(max(reply_count, 1) / 100))
     return max(PASS2_MIN_INTERVAL_MIN, min(PASS2_MAX_INTERVAL_MIN, pages))
+
+
+def dead_ratio_is_suspect(total: int, dead_count: int) -> bool:
+    """Pass1 の「消滅」判定を信用してよいか。
+
+    True なら、この回は削除マーキングをスキップすべき(実データ破損より
+    取りこぼしを選ぶ — 次回の Pass1 で再検知できるので恒久的な見逃しにはならない)。
+    バッチが小さいうちは1件の本当の削除でも比率が跳ねるため、
+    KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD 件未満では常に信用する(比率判定自体が
+    無意味なほど小さいサンプルなので、直接の signal を優先する)。
+    """
+    if total < KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD:
+        return False
+    return (dead_count / total) > KSK_MAX_DEAD_RATIO
 
 
 def pass2_due(thread: dict, reply_count: int, now_epoch: int) -> bool:

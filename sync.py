@@ -1499,6 +1499,13 @@ def _write_ksk_index(client: TursoClient, now_epoch: int) -> None:
 KSK_API_KEY = os.getenv("API_KEY_FOR_KSK", "").strip()
 KSK_TIME_BUDGET_SEC = 25  # main() 開始からこの秒数を超えたら ksk の追跡を打ち切る
 
+# KSK_TIME_BUDGET_SEC は main() 開始(run_started_at)からの経過で測るため、
+# sync_new_comments() が長引くコメント急増時ほど ksk の取り分が削られる。
+# ちょうど ksk が最も活発なタイミングと相関するため、毎分ゼロになりかねない
+# ワーストケースを避けるための下限。全体の実行時間を守る上限
+# (run_started_at基準)自体は残しつつ、ksk追跡の開始時点から最低これだけは確保する。
+KSK_MIN_GUARANTEED_SEC = 10
+
 _ksk_youtube = None
 
 
@@ -1659,10 +1666,27 @@ def run_ksk_tracking(client: TursoClient, now_epoch: int, deadline: float) -> in
         ksk_common.write_quota_state(client, now_epoch, quota["units_used"] + units)
         return 0
 
+    # 「応答に含まれなかった=削除された」という判定は、YouTube側の一時的な不整合
+    # (グリッチ)でも成立してしまう。_ksk_pass1 は _MAX_DEAD_RATIO のような安全弁を
+    # 持たない(commentThreads.list(id=)が正常応答・nextPageTokenも無しでも、
+    # 依頼したIDの一部が理由不明で欠けることがある)。一度 ended(deleted) にすると
+    # 同じ comment_id は二度と再登録できないため、ここで比率を見て怪しければ
+    # 今回は削除判定そのものを見送る(次回の Pass1 で再検知できるので恒久的な
+    # 見逃しにはならない — sync.py の _MAX_DEAD_RATIO と同じ思想)。
+    dead_ids = {t["thread_id"] for t in active} - alive
+    suspect = ksk_common.dead_ratio_is_suspect(len(active), len(dead_ids))
+    if suspect:
+        print(
+            f"  WARNING: ksk Pass1: {len(active)}件中{len(dead_ids)}件が消滅と判定された。"
+            f"異常値のため削除判定をスキップする(速度更新は続行)", flush=True,
+        )
+
     changed = 0
     for thread in active:
         tid = thread["thread_id"]
         if tid not in alive:
+            if suspect:
+                continue
             ksk_common.end_thread(client, tid, ksk_common.REASON_DELETED, now_epoch)
             changed += 1
             continue
@@ -1769,13 +1793,19 @@ def main():
     # 実行時間バジェット: 1000返信のPass2は逐次HTTP10回になり得る。毎分ジョブが60秒を
     # 超えると concurrency group により次の分の実行が待たされ、新着同期そのものが遅れる。
     # main()開始からの経過を見て、超過していたら追跡を打ち切る(次の分に持ち越すだけ)。
-    ksk_deadline = run_started_at + KSK_TIME_BUDGET_SEC
     try:
         n_ksk = check_ksk_commands(client, int(now.timestamp()))
         if n_ksk:
             print(f"  ksk 状態変化: {n_ksk} 件")
     except Exception as e:
         print(f"  kskコマンド検出エラー: {e}", flush=True)
+    # sync_new_comments()/check_ksk_commands() がここまでに使った時間ぶん、
+    # run_started_at基準の上限は既に食われている。それでも最低
+    # KSK_MIN_GUARANTEED_SEC秒は確保する(下限、上のKSK_MIN_GUARANTEED_SEC注記参照)。
+    ksk_deadline = max(
+        run_started_at + KSK_TIME_BUDGET_SEC,
+        time.monotonic() + KSK_MIN_GUARANTEED_SEC,
+    )
     try:
         n_track = run_ksk_tracking(client, int(now.timestamp()), ksk_deadline)
         if n_track:

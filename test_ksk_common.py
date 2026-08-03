@@ -382,5 +382,22 @@ class AggregateRowsTest(unittest.TestCase):
         self.assertEqual((q1, q2, gaps, medians), ([], [], [], {}))
 
 
+class DeadRatioIsSuspectTest(unittest.TestCase):
+    def test_small_batch_always_trusted(self):
+        # KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD 未満は比率判定そのものが無意味なので、
+        # 100%消滅でも「怪しい」とは判定しない(直接のsignalを信用する)
+        self.assertFalse(K.dead_ratio_is_suspect(1, 1))
+        self.assertFalse(K.dead_ratio_is_suspect(4, 4))
+
+    def test_large_batch_high_ratio_is_suspect(self):
+        self.assertTrue(K.dead_ratio_is_suspect(20, 15))
+
+    def test_large_batch_low_ratio_is_trusted(self):
+        self.assertFalse(K.dead_ratio_is_suspect(20, 2))
+
+    def test_boundary_at_guard_floor(self):
+        self.assertTrue(K.dead_ratio_is_suspect(K.KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD, 3))
+
+
 if __name__ == "__main__":
     unittest.main()

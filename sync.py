@@ -1392,6 +1392,9 @@ def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
     if not candidates:
         return 0
 
+    # main() の先頭で既に無条件ensure済みだが、この関数を単体で呼んでも安全なように
+    # ここでも呼ぶ(冪等・実質無料。test_sync.py の KskCommandRegistrationTests は
+    # main() を経由せずこの関数を直接呼ぶ)。
     ksk_common.ensure_schema(client)
     active = ksk_common.get_threads_by_state(client, ksk_common.STATE_ACTIVE)
     active_by_id = {t["thread_id"]: t for t in active}
@@ -1729,6 +1732,17 @@ def main():
             print("  account profile live-core trigger ready", flush=True)
     except Exception as e:
         print(f"  account profile live-core trigger setup failed: {e}", flush=True)
+
+    # ksk(加速)テーブルを毎回無条件でensureする(account_live_coreと同じパターン)。
+    # check_ksk_commands()自身は「!ksk を含む行が実際に見つかったときだけ」
+    # ensure_schema()を呼ぶ設計(コスト削減)だが、それだと誰も !ksk を打っていない
+    # 間はTurso上にksk_indexテーブルすら存在せず、flaskrの/api/ksk-threadsが
+    # 「テーブルが無い」例外を拾って503を返し続けてしまう(CREATE TABLE IF NOT EXISTS
+    # は冪等かつ実質無料なので、無条件で毎分呼んでも構わない)。
+    try:
+        ksk_common.ensure_schema(client)
+    except Exception as e:
+        print(f"  kskスキーマ準備エラー: {e}", flush=True)
 
     wait_until_next_minute()
 

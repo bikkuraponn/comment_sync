@@ -706,11 +706,16 @@ def aggregate_thread(turso: TursoClient, thread_id: str, top_n: int = TOP_ACCOUN
         statements.append({"sql": Q3_MEDIAN_GAP_SQL, "args": [thread_id, cid, (n - 1) // 2]})
         targets.append(cid)
 
+    # query_batch()(複数SELECTを1パイプラインにまとめる)は turso_client.py の
+    # コピーによって実装の有無が分かれる(flaskr側にはあるが comment_sync側には無い、
+    # 2026-08-03に本番エラーで発覚)。最大 TOP_ACCOUNTS(=8)件の単発 query() ループに
+    # 留め、コピー間の差異に依存しないようにする。Pass2 自体が1〜5分に1回しか
+    # 走らないので、往復が増えるコストは無視できる。
     medians: dict[str, int] = {}
-    if statements:
-        for cid, rows in zip(targets, turso.query_batch(statements)):
-            if rows and rows[0].get("gap") is not None:
-                medians[cid] = int(rows[0]["gap"])
+    for stmt, cid in zip(statements, targets):
+        rows = turso.query(stmt["sql"], stmt["args"])
+        if rows and rows[0].get("gap") is not None:
+            medians[cid] = int(rows[0]["gap"])
     return q1_rows, q2_rows, gap_rows, medians
 
 

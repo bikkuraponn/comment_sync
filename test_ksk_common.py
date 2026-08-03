@@ -277,5 +277,71 @@ class SqlShapeTest(unittest.TestCase):
         self.assertIn("LIMIT 1 OFFSET ?", K.Q3_MEDIAN_GAP_SQL)
 
 
+class _NoQueryBatchTurso:
+    """query_batch() を持たない偽Turso。
+
+    2026-08-03、本番で 'TursoClient' object has no attribute 'query_batch' が
+    発生した(comment_sync/turso_client.py のコピーには query_batch() が無いのに
+    aggregate_thread() がそれを呼んでいた — turso_client.py は複数コピー間で
+    手動同期のため、flaskr側にあるからと言って comment_sync側にもあるとは限らない)。
+    このクラスはあえて query_batch を実装しない = 呼んだ瞬間 AttributeError で
+    落ちるので、aggregate_thread() が query_batch に依存しなくなったことを固定する。
+
+    Q1/Q3本体はどちらも "SELECT author_channel_id," で始まり先頭一致では
+    区別できないため、各クエリに固有の部分文字列でルーティングする。
+    """
+
+    def __init__(self, responses):
+        self._responses = responses  # [(distinguishing substring, rows|callable), ...]
+        self.calls = []
+
+    def query(self, sql, args=None):
+        self.calls.append((sql, args))
+        for marker, rows in self._responses:
+            if marker in sql:
+                return rows(args) if callable(rows) else rows
+        return []
+
+
+class AggregateThreadTest(unittest.TestCase):
+    def test_does_not_require_query_batch(self):
+        gap_row = {"author_channel_id": "UC_a", "gap_n": 3}
+
+        def median_rows(args):
+            # args = [thread_id, channel_id, offset]
+            self.assertEqual(args[1], "UC_a")
+            return [{"gap": 7}]
+
+        turso = _NoQueryBatchTurso([
+            ("ORDER BY c DESC",
+             [{"author_channel_id": "UC_a", "handle": "@a", "c": 5,
+               "first_at": 1, "last_at": 2}]),
+            ("published_at / 60", []),
+            ("AVG(gap)", [gap_row]),
+            ("LIMIT 1 OFFSET", median_rows),
+        ])
+
+        q1, q2, gaps, medians = K.aggregate_thread(turso, "Ugy_test")
+
+        self.assertEqual(medians, {"UC_a": 7})
+        self.assertFalse(hasattr(turso, "query_batch"))
+
+    def test_skips_median_lookup_when_no_gap_data(self):
+        # gap_n が無い(=まだ2投稿していない)アカウントは median クエリ自体を投げない
+        turso = _NoQueryBatchTurso([
+            ("ORDER BY c DESC",
+             [{"author_channel_id": "UC_a", "handle": "@a", "c": 1,
+               "first_at": 1, "last_at": 1}]),
+            ("published_at / 60", []),
+            ("AVG(gap)", []),
+        ])
+
+        _q1, _q2, _gaps, medians = K.aggregate_thread(turso, "Ugy_test")
+
+        self.assertEqual(medians, {})
+        median_calls = [c for c in turso.calls if "LIMIT 1 OFFSET" in c[0]]
+        self.assertEqual(median_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

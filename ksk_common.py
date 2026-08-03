@@ -227,6 +227,17 @@ _COMMAND_RE = re.compile(
 
 _STOP_ARG_RE = re.compile(r"^stop\b", re.IGNORECASE)
 
+# `!ksk stop` / `/ksk stop` に加えて、単に「終了」と返信するだけでも止められるようにする
+# （スマホから記号を打つのが面倒なため）。
+#
+# **こちらだけは「行全体が終了」を要求する**（`!ksk` 系の「本文のどこかにあればOK」とは
+# 意図的に扱いを変えている）。「終了」は普通の日本語なので、含むだけで発火させると
+# 「そろそろ終了かな」「終了までもう少し」のような何気ない発言でスレッドが止まる。
+# 一度 ended にしたスレッドは同じ comment_id では復活できない（新しくスレッドを
+# 立て直してもらうことになる）ため、ここは誤爆しない側に倒す。
+# 末尾の句読点・感嘆符・「w」は自然な打ち方なので許容する。
+_STOP_WORD_RE = re.compile(r"\A終了[\s!！?？。．、,.ｗw]*\Z")
+
 ACTION_START = "start"
 ACTION_STOP = "stop"
 
@@ -248,22 +259,26 @@ def parse_command(text) -> dict | None:
 
     戻り値:
       {"action": "start", "title": str|None}  … `!ksk` / `!ksk タイトル` / `加速するぞ /ksk`
-      {"action": "stop"}                      … `!ksk stop`
+      {"action": "stop"}                      … `!ksk stop` / `/ksk stop` / 行全体が「終了」
       None                                    … コマンドではない
 
     タイトルはコマンド語より後ろの、同じ行の残りを使う（無ければ None）。
     text が None(削除済み行の text は NULL)や非文字列なら None。
+
+    停止コマンドが実際に効くのは「スレ主本人が自分の稼働中スレッドに返信した場合」だけ
+    （判定は呼び出し側の check_ksk_commands）。ここでは文面の判定しかしない。
     """
     if not isinstance(text, str) or not text:
         return None
     for line in normalize_text(text).splitlines():
         m = _COMMAND_RE.search(line)
-        if m is None:
-            continue
-        rest = line[m.end():].strip()
-        if _STOP_ARG_RE.match(rest):
+        if m is not None:
+            rest = line[m.end():].strip()
+            if _STOP_ARG_RE.match(rest):
+                return {"action": ACTION_STOP}
+            return {"action": ACTION_START, "title": rest[:TITLE_MAX_LEN] or None}
+        if _STOP_WORD_RE.match(line.strip()):
             return {"action": ACTION_STOP}
-        return {"action": ACTION_START, "title": rest[:TITLE_MAX_LEN] or None}
     return None
 
 

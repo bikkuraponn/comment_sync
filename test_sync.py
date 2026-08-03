@@ -441,6 +441,31 @@ class KskCommandRegistrationTests(unittest.TestCase):
         active = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
         self.assertEqual(len(active), ksk_common.MAX_ACTIVE_THREADS)
 
+    def test_owner_can_stop_with_bare_owari(self):
+        self._post("t1", "UC_a", "!ksk", published_at=1_000_000)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        self._post("r1", "UC_a", "終了", parent_id="t1", published_at=1_000_020)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        row = self.client.query(
+            "SELECT state, ended_reason FROM ksk_threads WHERE thread_id='t1'")[0]
+        self.assertEqual(row["state"], "ended")
+        self.assertEqual(row["ended_reason"], "stopped")
+
+    def test_owari_from_someone_else_does_not_stop(self):
+        # 止められるのはスレ主本人だけ(他人が「終了」と書いても効かない)
+        self._post("t1", "UC_a", "!ksk", published_at=1_000_000)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        self._post("r1", "UC_other", "終了", parent_id="t1", published_at=1_000_020)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        self.assertEqual(
+            self.client.query("SELECT state FROM ksk_threads WHERE thread_id='t1'")[0]["state"],
+            "active",
+        )
+
     def test_newest_thread_wins_within_one_scan(self):
         # 同じスキャンで複数打った場合は最後のものが採用される
         self._post("t1", "UC_a", "!ksk 1本目", published_at=1_000_000)

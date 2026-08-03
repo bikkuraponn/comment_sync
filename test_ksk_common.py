@@ -34,6 +34,23 @@ class ParseCommandTest(unittest.TestCase):
         self.assertEqual(K.parse_command("/ksk STOP"), {"action": "stop"})
         self.assertEqual(K.parse_command("終わり /ksk stop!"), {"action": "stop"})
 
+    def test_bare_owari_word_stops(self):
+        # スマホから記号を打つのが面倒なので「終了」だけでも止められる
+        self.assertEqual(K.parse_command("終了"), {"action": "stop"})
+        self.assertEqual(K.parse_command("  終了  "), {"action": "stop"})
+        self.assertEqual(K.parse_command("終了！"), {"action": "stop"})
+        self.assertEqual(K.parse_command("終了。"), {"action": "stop"})
+        self.assertEqual(K.parse_command("終了w"), {"action": "stop"})
+        # 複数行のうち1行が「終了」でもよい
+        self.assertEqual(K.parse_command("おつかれ\n終了"), {"action": "stop"})
+
+    def test_owari_inside_a_sentence_does_not_stop(self):
+        # 「終了」は普通の日本語なので、行全体が終了のときだけ発火させる。
+        # 含むだけで止めると何気ない発言でスレッドが死に、復活もできない
+        self.assertIsNone(K.parse_command("そろそろ終了かな"))
+        self.assertIsNone(K.parse_command("終了までもう少し"))
+        self.assertIsNone(K.parse_command("終了したくない"))
+
     def test_word_boundary_after_ksk(self):
         # `!kskstop` は ksk の直後が英数字なのでコマンド語ではない
         self.assertIsNone(K.parse_command("!kskstop"))

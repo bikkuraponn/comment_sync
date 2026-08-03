@@ -23,6 +23,7 @@ from googleapiclient.errors import HttpError
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sync
+import ksk_common
 import account_live_core
 
 
@@ -370,6 +371,75 @@ class KeyRotationPropagationTests(unittest.TestCase):
             )
 
         self.assertTrue(aborted)
+
+
+class KskCommandRegistrationTests(unittest.TestCase):
+    """check_ksk_commands() を実DB(sqlite)に対して回す回帰テスト。
+
+    ksk_common のスキーマ(ON CONFLICT/CHECK制約等)は libSQL 前提だが、
+    sqlite3 でも同じ文法が通るため、AccountLiveCoreTests と同じ
+    SqliteTurso を使う(モックだと「本当にINSERT/UPDATEされたか」まで
+    確認できないため)。
+    """
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, published_at INTEGER, text TEXT, "
+            "is_deleted INTEGER DEFAULT 0)"
+        )
+
+    def _post(self, comment_id, author, text, parent_id=None, published_at=1_000_000):
+        self.client.execute(
+            "INSERT INTO comments(comment_id,parent_id,author_channel_id,handle,published_at,text) "
+            "VALUES(?,?,?,?,?,?)",
+            [comment_id, parent_id, author, "@" + author, published_at, text],
+        )
+
+    def _active_owners(self):
+        rows = self.client.query(
+            "SELECT owner_channel_id FROM ksk_threads WHERE state = 'active'"
+        )
+        return [r["owner_channel_id"] for r in rows]
+
+    def test_same_account_cannot_run_two_threads_at_once(self):
+        self._post("t1", "UC_a", "!ksk 1本目", published_at=1_000_000)
+        sync.check_ksk_commands(self.client, 1_000_060)
+        self.assertEqual(self._active_owners(), ["UC_a"])
+
+        # 同じアカウントが別スレッドで !ksk を打っても登録されない
+        self._post("t2", "UC_a", "!ksk 2本目", published_at=1_000_010)
+        sync.check_ksk_commands(self.client, 1_000_060)
+        rows = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual([r["thread_id"] for r in rows], ["t1"])
+        self.assertEqual(
+            self.client.query("SELECT thread_id FROM ksk_threads WHERE thread_id = 't2'"), []
+        )
+
+    def test_account_can_start_a_new_thread_after_stopping(self):
+        self._post("t1", "UC_a", "!ksk 1本目", published_at=1_000_000)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        self._post("r1", "UC_a", "!ksk stop", parent_id="t1", published_at=1_000_020)
+        sync.check_ksk_commands(self.client, 1_000_060)
+        self.assertEqual(
+            self.client.query("SELECT state FROM ksk_threads WHERE thread_id = 't1'")[0]["state"],
+            "ended",
+        )
+
+        self._post("t2", "UC_a", "!ksk 2本目", published_at=1_000_030)
+        sync.check_ksk_commands(self.client, 1_000_060)
+        self.assertEqual(self._active_owners(), ["UC_a"])
+
+    def test_global_cap_rejects_beyond_max_active_threads(self):
+        for i in range(ksk_common.MAX_ACTIVE_THREADS + 3):
+            self._post(f"t{i}", f"UC_{i}", "!ksk", published_at=1_000_000 + i)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        active = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual(len(active), ksk_common.MAX_ACTIVE_THREADS)
 
 
 if __name__ == "__main__":

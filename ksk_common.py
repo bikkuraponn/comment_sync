@@ -3,8 +3,8 @@
 「ksk(加速)」= 誰かがスレッド(親コメント)を立て、参加者がそこに返信を連投しまくって
 動画全体のコメント数・個人のコメント数を稼ぐ文化。flaskr の `/ksk` ページ用のデータを作る。
 
-対象は**オプトイン**。スレ主が `!ksk`(または `/ksk`)を含む親コメントを立てたスレッド
-だけを追跡する。理由は2つ:
+対象は**オプトイン**。スレ主が `!ksk`(または `/ksk`、あるいは `EXTRA_TRIGGER_PHRASES`
+の決まり文句)を含む親コメントを立てたスレッドだけを追跡する。理由は2つ:
   1. 「誰が何割連投したか」の無差別な常時公開は晒し・炎上装置になり得る
   2. 追跡対象が無制限に増えないので、YouTube API クォータ枯らし攻撃への防御になる
 
@@ -225,6 +225,18 @@ _COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 
+# `!ksk`/`/ksk` 以外にも、この文化圏で実際に使われる決まり文句を含むだけで
+# 登録対象にする（ユーザー指定の完全一致文字列、NFKC正規化後）。
+# `!ksk` と違ってコマンド語の後ろにタイトルが続く形を仮定していない自然文なので、
+# マッチ後の残りをタイトルとして取らない（title は常に None）。
+# バリエーションは増やさず、必要になれば都度足す。
+EXTRA_TRIGGER_PHRASES = [
+    "kskチャレンジ",
+    "加速チャレンジ",
+    "連投チャレンジ",
+    "ここだけ1000コメいく",
+]
+
 _STOP_ARG_RE = re.compile(r"^stop\b", re.IGNORECASE)
 
 # `!ksk stop` / `/ksk stop` に加えて、単に「終了」と返信するだけでも止められるようにする
@@ -258,11 +270,15 @@ def parse_command(text) -> dict | None:
     現れる場合は、最初に見つかった行を採用する。
 
     戻り値:
-      {"action": "start", "title": str|None}  … `!ksk` / `!ksk タイトル` / `加速するぞ /ksk`
+      {"action": "start", "title": str|None}  … `!ksk` / `!ksk タイトル` / `加速するぞ /ksk` /
+                                                  EXTRA_TRIGGER_PHRASES のいずれかを含む行
       {"action": "stop"}                      … `!ksk stop` / `/ksk stop` / 行全体が「終了」
       None                                    … コマンドではない
 
     タイトルはコマンド語より後ろの、同じ行の残りを使う（無ければ None）。
+    EXTRA_TRIGGER_PHRASES 側は自然文の一部としてマッチするため、後ろの文字列を
+    タイトルとして取らない（常に None — 例えば「今日は加速チャレンジやります」の
+    「やります」をタイトルにしても意味が無い）。
     text が None(削除済み行の text は NULL)や非文字列なら None。
 
     停止コマンドが実際に効くのは「スレ主本人が自分の稼働中スレッドに返信した場合」だけ
@@ -279,6 +295,8 @@ def parse_command(text) -> dict | None:
             return {"action": ACTION_START, "title": rest[:TITLE_MAX_LEN] or None}
         if _STOP_WORD_RE.match(line.strip()):
             return {"action": ACTION_STOP}
+        if any(phrase in line for phrase in EXTRA_TRIGGER_PHRASES):
+            return {"action": ACTION_START, "title": None}
     return None
 
 

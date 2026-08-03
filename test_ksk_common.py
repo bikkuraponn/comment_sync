@@ -44,6 +44,27 @@ class ParseCommandTest(unittest.TestCase):
         # 複数行のうち1行が「終了」でもよい
         self.assertEqual(K.parse_command("おつかれ\n終了"), {"action": "stop"})
 
+    def test_extra_trigger_phrases_register(self):
+        for phrase in K.EXTRA_TRIGGER_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertEqual(
+                    K.parse_command(phrase), {"action": "start", "title": None})
+
+    def test_extra_trigger_phrase_embedded_in_a_sentence(self):
+        self.assertEqual(
+            K.parse_command("今日は加速チャレンジやります！"),
+            {"action": "start", "title": None},
+        )
+        self.assertEqual(
+            K.parse_command("みんなで連投チャレンジしよう"),
+            {"action": "start", "title": None},
+        )
+
+    def test_extra_trigger_phrase_title_is_always_none(self):
+        # !ksk と違い、後ろの文字列をタイトルとして拾わない
+        got = K.parse_command("kskチャレンジ 深夜の部やります")
+        self.assertIsNone(got["title"])
+
     def test_owari_inside_a_sentence_does_not_stop(self):
         # 「終了」は普通の日本語なので、行全体が終了のときだけ発火させる。
         # 含むだけで止めると何気ない発言でスレッドが死に、復活もできない

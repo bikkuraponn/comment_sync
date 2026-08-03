@@ -1401,9 +1401,12 @@ def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
     active_owners = {t["owner_channel_id"] for t in active}
     active_count = len(active)
 
+    # 登録候補はアカウントごとに1件へ絞る（同一スキャン内で複数打っていたら最新を採用）。
+    # scan_counts は絞る前の件数 = 連投の度合いなので、自動BAN判定に使う。
+    start_candidates, scan_counts = ksk_common.select_start_candidates(candidates)
+
     # 既に登録済み（active/ended どちらでも）の thread_id は上限判定をやり直さない。
-    thread_ids = [r["comment_id"] for r, c in candidates
-                  if r.get("parent_id") is None and c["action"] == ksk_common.ACTION_START]
+    thread_ids = [r["comment_id"] for r, _c in start_candidates]
     known_ids: set[str] = set()
     if thread_ids:
         placeholders = ",".join("?" for _ in thread_ids)
@@ -1418,30 +1421,44 @@ def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
     day_start = ksk_common.jst_day_start_epoch(now_epoch)
     changed = 0
 
+    # 1スキャンで大量にコマンドを打ったアカウントは自動BANする。
+    # 判定は登録処理より先に行う（BANしたアカウントのスレッドをその場で弾くため）。
+    for cid in ksk_common.auto_ban_targets(scan_counts):
+        if cid in banned:
+            continue
+        reason = (f"auto: {scan_counts[cid]} ksk commands in one "
+                  f"{ksk_common.DETECT_WINDOW_MIN}min scan at {now_epoch}")
+        ksk_common.add_ban(client, cid, reason, now_epoch)
+        banned.add(cid)
+        n_ended = ksk_common.end_threads_of_owner(
+            client, cid, ksk_common.REASON_BANNED, now_epoch)
+        changed += 1 + n_ended
+        print(f"  ksk 自動BAN: {cid} ({reason}) 稼働中スレッド{n_ended}件を終了", flush=True)
+
+    # 解除コマンドは絞り込み前の全候補から拾う（返信として打たれるため、
+    # select_start_candidates() が落とした行にも含まれ得る）。
     for row, cmd in candidates:
-        is_thread = row.get("parent_id") is None
-        author = row.get("author_channel_id")
-
-        if cmd["action"] == ksk_common.ACTION_STOP:
-            # 解除はスレ主本人が自分の active スレッドに返信した場合のみ
-            if is_thread:
-                continue
-            thread = active_by_id.get(row.get("parent_id"))
-            if thread is None or thread["owner_channel_id"] != author:
-                continue
-            ksk_common.end_thread(client, thread["thread_id"], ksk_common.REASON_STOPPED, now_epoch)
-            active_by_id.pop(thread["thread_id"], None)
-            active_owners.discard(thread["owner_channel_id"])
-            active_count -= 1
-            changed += 1
-            print(f"  ksk 解除: {thread['thread_id']}", flush=True)
+        if cmd["action"] != ksk_common.ACTION_STOP:
             continue
-
-        # 登録コマンドは親コメント本文にしか置けない。返信として打たれた `!ksk` を
-        # 登録に使うと、既存スレッドへの返信を拾う経路が30分おきの巡回チェックしか
-        # 無いため最大30分検知できず、仕様として成立しない。
-        if not is_thread or not author:
+        # 解除はスレ主本人が自分の active スレッドに返信した場合のみ
+        if row.get("parent_id") is None:
             continue
+        thread = active_by_id.get(row.get("parent_id"))
+        if thread is None or thread["owner_channel_id"] != row.get("author_channel_id"):
+            continue
+        ksk_common.end_thread(client, thread["thread_id"], ksk_common.REASON_STOPPED, now_epoch)
+        active_by_id.pop(thread["thread_id"], None)
+        active_owners.discard(thread["owner_channel_id"])
+        active_count -= 1
+        changed += 1
+        print(f"  ksk 解除: {thread['thread_id']}", flush=True)
+
+    # 登録はアカウントごとに絞り込み済みの候補だけを見る。
+    # 登録コマンドが親コメント本文限定なのは、返信として打たれた `!ksk` だと
+    # 既存スレッドへの返信を拾う経路が30分おきの巡回チェックしか無く、最大30分
+    # 検知できないため（select_start_candidates() が親コメントだけを残している）。
+    for row, cmd in start_candidates:
+        author = row["author_channel_id"]
         thread_id = row["comment_id"]
         if thread_id in known_ids:
             continue

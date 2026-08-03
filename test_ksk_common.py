@@ -382,6 +382,69 @@ class AggregateRowsTest(unittest.TestCase):
         self.assertEqual((q1, q2, gaps, medians), ([], [], [], {}))
 
 
+def _cand(comment_id, author, ts, title=None, parent_id=None, action=K.ACTION_START):
+    row = {"comment_id": comment_id, "author_channel_id": author,
+           "published_at": ts, "parent_id": parent_id}
+    cmd = {"action": action} if action == K.ACTION_STOP else {"action": action, "title": title}
+    return (row, cmd)
+
+
+class SelectStartCandidatesTest(unittest.TestCase):
+    def test_newest_wins_for_the_same_account(self):
+        # 短時間に連続で打つのは打ち直しなので、最後のものを採用する
+        selected, counts = K.select_start_candidates([
+            _cand("t1", "UC_a", 100, title="1本目"),
+            _cand("t2", "UC_a", 200, title="2本目"),
+            _cand("t3", "UC_a", 150, title="間の1本"),
+        ])
+        self.assertEqual([r["comment_id"] for r, _c in selected], ["t2"])
+        self.assertEqual(selected[0][1]["title"], "2本目")
+        self.assertEqual(counts, {"UC_a": 3})
+
+    def test_different_accounts_all_kept(self):
+        selected, counts = K.select_start_candidates([
+            _cand("t1", "UC_a", 100),
+            _cand("t2", "UC_b", 110),
+        ])
+        self.assertEqual({r["comment_id"] for r, _c in selected}, {"t1", "t2"})
+        self.assertEqual(counts, {"UC_a": 1, "UC_b": 1})
+
+    def test_replies_and_stops_are_excluded(self):
+        selected, counts = K.select_start_candidates([
+            _cand("r1", "UC_a", 100, parent_id="t1"),          # 返信の登録コマンドは無効
+            _cand("r2", "UC_a", 110, parent_id="t1", action=K.ACTION_STOP),
+            _cand("t9", "UC_a", 120),                            # これだけ有効
+        ])
+        self.assertEqual([r["comment_id"] for r, _c in selected], ["t9"])
+        self.assertEqual(counts, {"UC_a": 1})
+
+    def test_rows_without_author_are_skipped(self):
+        selected, counts = K.select_start_candidates([_cand("t1", None, 100)])
+        self.assertEqual(selected, [])
+        self.assertEqual(counts, {})
+
+    def test_selected_is_sorted_by_published_at(self):
+        selected, _counts = K.select_start_candidates([
+            _cand("t1", "UC_b", 300),
+            _cand("t2", "UC_a", 100),
+        ])
+        self.assertEqual([r["comment_id"] for r, _c in selected], ["t2", "t1"])
+
+
+class AutoBanTargetsTest(unittest.TestCase):
+    def test_at_threshold_is_banned(self):
+        counts = {"UC_a": K.AUTO_BAN_THREADS_PER_SCAN}
+        self.assertEqual(K.auto_ban_targets(counts), ["UC_a"])
+
+    def test_below_threshold_is_not_banned(self):
+        counts = {"UC_a": K.AUTO_BAN_THREADS_PER_SCAN - 1}
+        self.assertEqual(K.auto_ban_targets(counts), [])
+
+    def test_only_offending_accounts_returned(self):
+        counts = {"UC_a": K.AUTO_BAN_THREADS_PER_SCAN + 5, "UC_b": 1}
+        self.assertEqual(K.auto_ban_targets(counts), ["UC_a"])
+
+
 class DeadRatioIsSuspectTest(unittest.TestCase):
     def test_small_batch_always_trusted(self):
         # KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD 未満は比率判定そのものが無意味なので、

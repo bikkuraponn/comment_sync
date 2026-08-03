@@ -441,6 +441,98 @@ class KskCommandRegistrationTests(unittest.TestCase):
         active = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
         self.assertEqual(len(active), ksk_common.MAX_ACTIVE_THREADS)
 
+    def test_newest_thread_wins_within_one_scan(self):
+        # 同じスキャンで複数打った場合は最後のものが採用される
+        self._post("t1", "UC_a", "!ksk 1本目", published_at=1_000_000)
+        self._post("t2", "UC_a", "!ksk 2本目", published_at=1_000_020)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        rows = self.client.query(
+            "SELECT thread_id, title FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual([r["thread_id"] for r in rows], ["t2"])
+        self.assertEqual(rows[0]["title"], "2本目")
+
+    def test_already_running_thread_is_not_replaced_by_a_later_one(self):
+        # 別スキャンで後から立てたスレッドが、走っているスレッドを置き換えないこと
+        self._post("t1", "UC_a", "!ksk 走行中", published_at=1_000_000)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        self._post("t2", "UC_a", "!ksk 後発", published_at=1_000_100)
+        sync.check_ksk_commands(self.client, 1_000_160)
+
+        rows = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual([r["thread_id"] for r in rows], ["t1"])
+
+
+class KskAutoBanTest(unittest.TestCase):
+    """1スキャンで大量にコマンドを打ったアカウントの自動BAN(2026-08-03追加)。"""
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, published_at INTEGER, text TEXT, "
+            "is_deleted INTEGER DEFAULT 0)"
+        )
+
+    def _post(self, comment_id, author, text, parent_id=None, published_at=1_000_000):
+        self.client.execute(
+            "INSERT INTO comments(comment_id,parent_id,author_channel_id,handle,published_at,text) "
+            "VALUES(?,?,?,?,?,?)",
+            [comment_id, parent_id, author, "@" + author, published_at, text],
+        )
+
+    def _bans(self):
+        return {r["channel_id"]: r["reason"]
+                for r in self.client.query("SELECT channel_id, reason FROM ksk_bans")}
+
+    def test_spamming_account_is_auto_banned_and_not_registered(self):
+        n = ksk_common.AUTO_BAN_THREADS_PER_SCAN
+        for i in range(n):
+            self._post(f"t{i}", "UC_spam", "!ksk", published_at=1_000_000 + i)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        self.assertIn("UC_spam", self._bans())
+        active = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual(active, [], "BANされたアカウントのスレッドは登録されない")
+
+    def test_ban_reason_records_the_evidence(self):
+        n = ksk_common.AUTO_BAN_THREADS_PER_SCAN + 2
+        for i in range(n):
+            self._post(f"t{i}", "UC_spam", "!ksk", published_at=1_000_000 + i)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        # 誤検知し得るので、後から人手で判断できる根拠を残すこと
+        self.assertIn(str(n), self._bans()["UC_spam"])
+
+    def test_below_threshold_is_not_banned(self):
+        for i in range(ksk_common.AUTO_BAN_THREADS_PER_SCAN - 1):
+            self._post(f"t{i}", "UC_ok", "!ksk", published_at=1_000_000 + i)
+        sync.check_ksk_commands(self.client, 1_000_060)
+
+        self.assertEqual(self._bans(), {})
+        active = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual(len(active), 1, "最新の1件だけ登録される")
+
+    def test_auto_ban_ends_already_running_thread(self):
+        # 先にスレッドを走らせておき、後から連投してBANされたら追跡も止まること
+        self._post("t_old", "UC_spam", "!ksk 先行", published_at=1_000_000)
+        sync.check_ksk_commands(self.client, 1_000_060)
+        self.assertEqual(
+            self.client.query("SELECT state FROM ksk_threads WHERE thread_id='t_old'")[0]["state"],
+            "active",
+        )
+
+        for i in range(ksk_common.AUTO_BAN_THREADS_PER_SCAN):
+            self._post(f"t{i}", "UC_spam", "!ksk", published_at=1_000_100 + i)
+        sync.check_ksk_commands(self.client, 1_000_160)
+
+        row = self.client.query(
+            "SELECT state, ended_reason FROM ksk_threads WHERE thread_id='t_old'")[0]
+        self.assertEqual(row["state"], "ended")
+        self.assertEqual(row["ended_reason"], "banned")
+
 
 class KskDeadRatioTrackingTest(unittest.TestCase):
     """run_ksk_tracking() が Pass1 の消滅判定に安全弁を持つことを固定する(2026-08-03追加)。

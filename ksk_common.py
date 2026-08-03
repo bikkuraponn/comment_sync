@@ -64,6 +64,16 @@ TITLE_MAX_LEN = 40
 MAX_ACTIVE_THREADS = 20
 # 1チャンネルが1日に登録できる回数。
 MAX_REGISTRATIONS_PER_DAY = 3
+
+# 1回の窓スキャン(DETECT_WINDOW_MIN=5分)の中で、同一アカウントが立てた
+# 「登録コマンド入りの親コメント」がこの件数以上なら自動BANする。
+#
+# 注意: 検出仕様が「本文のどこかに !ksk / /ksk が含まれていれば該当」なので、
+# ksk について語っただけのコメントも数に入る(例: 「みんな /ksk で立てて」)。
+# 加速が盛り上がっている最中に熱心な人が短時間で何度も言及すると誤BANになり得る。
+# そのため閾値は「明らかに機械的な連投」と言える水準に置き、BANの理由文へ
+# 件数と根拠を残して後から人手で取り消せるようにしている(ksk_bans から DELETE)。
+AUTO_BAN_THREADS_PER_SCAN = 4
 # 返信がこの件数に達するまで T2(返信の完全取得)を起動しない。
 # 誰も乗らなかった `!ksk` が API units を食わないようにするため
 # (T1 の Pass1 は全 active スレッド合計で1 unit なので、放置しても実質無料)。
@@ -255,6 +265,47 @@ def parse_command(text) -> dict | None:
             return {"action": ACTION_STOP}
         return {"action": ACTION_START, "title": rest[:TITLE_MAX_LEN] or None}
     return None
+
+
+def select_start_candidates(candidates: list) -> tuple[list, dict[str, int]]:
+    """登録コマンド候補をアカウントごとに1件へ絞る（純関数）。
+
+    candidates: [(row, cmd), ...]。row は comments の1行、cmd は parse_command() の戻り値。
+
+    戻り値: (採用する [(row, cmd), ...], {channel_id: そのスキャンでの該当件数})
+
+    **同一アカウントが1回のスキャンで複数該当した場合は最新(published_at最大)を採る。**
+    短時間に連続して `!ksk` を打つのは打ち直し・言い直しであることが多く、
+    最後に書いたものが本人の意図に一番近いため。
+    ただしこれは「まだどれも登録されていない」場合の話で、既に登録済みの
+    スレッドは呼び出し側が known_ids で弾く（走っているスレッドを後から
+    立てたスレッドで置き換えたりはしない）。
+
+    2つ目の戻り値は自動BAN判定用の件数。採用しなかった分も数える
+    （連投そのものを検知したいので、絞る前の数が必要）。
+    """
+    per_author: dict[str, tuple] = {}
+    counts: dict[str, int] = {}
+    for row, cmd in candidates:
+        if row.get("parent_id") is not None or cmd.get("action") != ACTION_START:
+            continue
+        author = row.get("author_channel_id")
+        if not author:
+            continue
+        counts[author] = counts.get(author, 0) + 1
+        prev = per_author.get(author)
+        if prev is None or int(row["published_at"]) >= int(prev[0]["published_at"]):
+            per_author[author] = (row, cmd)
+    # 元の候補順(published_at昇順)を保ったまま返す
+    selected = sorted(per_author.values(), key=lambda rc: int(rc[0]["published_at"]))
+    return selected, counts
+
+
+def auto_ban_targets(scan_counts: dict[str, int]) -> list[str]:
+    """1スキャン内の該当件数から自動BAN対象の channel_id を返す（純関数）。"""
+    return sorted(
+        cid for cid, n in scan_counts.items() if n >= AUTO_BAN_THREADS_PER_SCAN
+    )
 
 
 def jst_date_str(epoch: int) -> str:
@@ -497,9 +548,37 @@ def build_index_payload(threads: list[dict], now_epoch: int | None = None) -> di
 # ------------------------------------------------------------------ #
 
 def get_banned_channels(turso: TursoClient) -> set[str]:
-    """BAN 済み channel_id の集合。ksk_bans は運用者が手で入れる小テーブル。"""
+    """BAN 済み channel_id の集合。ksk_bans は運用者と自動BANが書く小テーブル。"""
     rows = turso.query("SELECT channel_id FROM ksk_bans")
     return {r["channel_id"] for r in rows}
+
+
+def add_ban(turso: TursoClient, channel_id: str, reason: str, now_epoch: int) -> None:
+    """BAN を登録する。既存なら理由だけ更新する（冪等）。
+
+    取り消しは `DELETE FROM ksk_bans WHERE channel_id = ?`。自動BANは誤検知し得る
+    ので、理由文に根拠（件数・スキャン時刻）を必ず残すこと。
+    """
+    turso.execute(
+        "INSERT INTO ksk_bans (channel_id, reason, created_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET reason = excluded.reason",
+        [channel_id, reason, now_epoch],
+    )
+
+
+def end_threads_of_owner(turso: TursoClient, channel_id: str, reason: str, now_epoch: int) -> int:
+    """そのアカウントの active スレッドを全部終了する。戻り値は対象件数。
+
+    BAN は「以後コマンドを無視する」だけの意味なので、BAN 前から走っている
+    スレッドは放置すると最大6時間追跡され続ける。BAN した以上は追跡も止める。
+    """
+    rows = turso.query(
+        "SELECT thread_id FROM ksk_threads WHERE owner_channel_id = ? AND state = ?",
+        [channel_id, STATE_ACTIVE],
+    )
+    for r in rows:
+        end_thread(turso, r["thread_id"], reason, now_epoch)
+    return len(rows)
 
 
 def get_threads_by_state(turso: TursoClient, state: str) -> list[dict]:

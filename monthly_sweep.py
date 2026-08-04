@@ -78,6 +78,9 @@ def _snapshot_thread_rows(client: TursoClient, thread_ids: list[str]) -> dict[st
     for offset in range(0, len(thread_ids), SNAPSHOT_IN_CHUNK):
         chunk = thread_ids[offset:offset + SNAPSHOT_IN_CHUNK]
         marks = ",".join("?" for _ in chunk)
+        # 2026-08-04, EXPLAIN QUERY PLAN確認済み(200件chunk): SQLiteのOR最適化により
+        # comment_id側はsqlite_autoindex_comments_1、parent_id側はidx_parent_publishedの
+        # 独立したSEARCHに分解される(MULTI-INDEX OR)。フルSCANにはならない。
         rows = client.query(
             "SELECT comment_id,parent_id,author_channel_id,handle,text,published_at,is_deleted "
             f"FROM comments WHERE comment_id IN ({marks}) OR parent_id IN ({marks})",

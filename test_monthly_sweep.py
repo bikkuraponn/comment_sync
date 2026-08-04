@@ -52,6 +52,38 @@ class MonthlySweepRepairTests(unittest.TestCase):
         self.assertEqual(work["account_map"], {"required"})
 
 
+class SqlShapeTest(unittest.TestCase):
+    """索引選択を左右する書き方が壊れていないことを固定する(test_ksk_common.SqlShapeTestと同じ狙い)。
+
+    2026-08-04, 本番TursoでのEXPLAIN QUERY PLAN確認結果(MULTI-INDEX OR、
+    comment_id側はsqlite_autoindex_comments_1、parent_id側はidx_parent_publishedの
+    独立SEARCH)は monthly_sweep._snapshot_thread_rows のコメントに記録済み。ここでは
+    その形(OR結合、author_channel_idを足さない)が将来の編集で崩れないことだけを守る。
+    """
+
+    def _captured_sql(self, thread_ids):
+        captured = {}
+
+        class _CapturingTurso:
+            def query(self, sql, args=None, timeout=30):
+                captured["sql"] = sql
+                captured["args"] = args
+                return []
+
+        monthly_sweep._snapshot_thread_rows(_CapturingTurso(), thread_ids)
+        return captured["sql"], captured["args"]
+
+    def test_snapshot_query_ors_comment_id_and_parent_id_only(self):
+        sql, args = self._captured_sql(["t1", "t2"])
+        self.assertIn("comment_id IN (", sql)
+        self.assertIn("OR parent_id IN (", sql)
+        where_clause = sql.split("WHERE", 1)[1]
+        self.assertNotIn("author_channel_id", where_clause)
+        # comment_id側・parent_id側それぞれにthread_idsぶんのプレースホルダ(2件→4個)
+        self.assertEqual(sql.count("?"), len(args))
+        self.assertEqual(len(args), 4)
+
+
 class MonthlySweepResumeTests(unittest.TestCase):
     def setUp(self):
         self.client = SqliteTurso()

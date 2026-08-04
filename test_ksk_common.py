@@ -278,6 +278,18 @@ class BuildPayloadTest(unittest.TestCase):
         payload = K.build_payload(self._thread(), [], [], [], {}, now_epoch=1)
         self.assertEqual(payload["reply_count"], 0)
         self.assertEqual(payload["accounts"], [])
+
+    def test_last_reply_at_is_max_across_all_accounts_not_just_top(self):
+        # 「全体の分速」の分母に使うため、上位TOP_ACCOUNTSに入らないアカウントの
+        # 返信時刻も見落とさないこと
+        q1 = self._q1(K.TOP_ACCOUNTS + 3, per=5)
+        q1[-1]["last_at"] = 9_999_999  # 上位に入らない最後のアカウントが実は一番新しい
+        payload = K.build_payload(self._thread(), q1, [], [], {}, now_epoch=1)
+        self.assertEqual(payload["last_reply_at"], 9_999_999)
+
+    def test_last_reply_at_is_none_when_no_replies(self):
+        payload = K.build_payload(self._thread(), [], [], [], {}, now_epoch=1)
+        self.assertIsNone(payload["last_reply_at"])
         self.assertEqual(payload["others"], {"count": 0, "accounts": 0})
 
 

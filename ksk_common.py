@@ -527,6 +527,15 @@ def build_payload(
         "accounts": len(rest),
     }
 
+    # 全アカウント(上位に限らない q1_rows 全体)の中で最後に返信が来た時刻。
+    # 「全体の分速」の分母を「開始〜最後の返信」に限定するために使う
+    # (「開始〜今/追跡終了時刻」だと、既に止まっているのに追跡がまだ続いている
+    # だけの時間が分母に混じり、分速が実態と無関係に薄まってしまう)。
+    last_reply_at = max(
+        (int(r["last_at"]) for r in q1_rows if r.get("last_at") is not None),
+        default=None,
+    )
+
     return {
         "v": PAYLOAD_VERSION,
         "thread_id": thread["thread_id"],
@@ -539,6 +548,7 @@ def build_payload(
         "started_at": int(thread["started_at"]),
         "ended_at": thread.get("ended_at"),
         "ended_reason": thread.get("ended_reason"),
+        "last_reply_at": last_reply_at,
         "updated_at": now,
         "reply_count": reply_count,
         "cap": REPLY_CAP,

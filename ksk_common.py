@@ -292,15 +292,20 @@ def parse_command(text) -> dict | None:
     現れる場合は、最初に見つかった行を採用する。
 
     戻り値:
-      {"action": "start", "title": str|None}  … `!ksk` / `!ksk タイトル` / `加速するぞ /ksk` /
-                                                  EXTRA_TRIGGER_PHRASES のいずれかを含む行
-      {"action": "stop"}                      … `!ksk stop` / `/ksk stop` / 行全体が「終了」
-      None                                    … コマンドではない
+      {"action": "start", "title": str}  … `!ksk` / `!ksk タイトル` / `加速するぞ /ksk` /
+                                             EXTRA_TRIGGER_PHRASES のいずれかを含む行
+      {"action": "stop"}                 … `!ksk stop` / `/ksk stop` / 行全体が「終了」
+      None                               … コマンドではない
 
-    タイトルはコマンド語より後ろの、同じ行の残りを使う（無ければ None）。
+    タイトルはコマンド語より後ろの、同じ行の残りを使う。**それが空なら、
+    検出したトリガーワード自体をタイトルとして使う**（`!ksk`/`/ksk`/
+    `加速チャレンジ` 等）。一覧・詳細ページはタイトル未設定時「加速」とだけ
+    表示していたが、全スレッドが同じ「加速」になって見分けがつかず、
+    わざわざ表示する意味が無かった — せめて何のワードで検出されたかを
+    出す方が有益（2026-08-04、ユーザー指摘で変更）。
     EXTRA_TRIGGER_PHRASES 側は自然文の一部としてマッチするため、後ろの文字列を
-    タイトルとして取らない（常に None — 例えば「今日は加速チャレンジやります」の
-    「やります」をタイトルにしても意味が無い）。
+    タイトルとして取らない（例えば「今日は加速チャレンジやります」の
+    「やります」をタイトルにしても意味が無い。マッチしたフレーズそのものを使う）。
     text が None(削除済み行の text は NULL)や非文字列なら None。
 
     停止コマンドが実際に効くのは「スレ主本人が自分の稼働中スレッドに返信した場合」だけ
@@ -314,11 +319,15 @@ def parse_command(text) -> dict | None:
             rest = line[m.end():].strip()
             if _STOP_ARG_RE.match(rest):
                 return {"action": ACTION_STOP}
-            return {"action": ACTION_START, "title": rest[:TITLE_MAX_LEN] or None}
+            # NFKC正規化後なので先頭は必ず半角 "!" か "/"。表記ゆれ(全角・空白)
+            # を吸収した綺麗な表示形にする。
+            trigger = m.group(0)[0] + "ksk"
+            return {"action": ACTION_START, "title": rest[:TITLE_MAX_LEN] or trigger}
         if _STOP_WORD_RE.match(line.strip()):
             return {"action": ACTION_STOP}
-        if any(phrase in line for phrase in EXTRA_TRIGGER_PHRASES):
-            return {"action": ACTION_START, "title": None}
+        for phrase in EXTRA_TRIGGER_PHRASES:
+            if phrase in line:
+                return {"action": ACTION_START, "title": phrase}
     return None
 
 

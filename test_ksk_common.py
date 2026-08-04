@@ -6,17 +6,20 @@ import ksk_common as K
 
 class ParseCommandTest(unittest.TestCase):
     def test_bare_bang_form(self):
-        self.assertEqual(K.parse_command("!ksk"), {"action": "start", "title": None})
+        # タイトルが無い場合、検出したトリガーワード自体をタイトルにする
+        # (全スレッドが同じ「加速」表示になって見分けがつかない問題への対応)
+        self.assertEqual(K.parse_command("!ksk"), {"action": "start", "title": "!ksk"})
 
     def test_bare_slash_form(self):
-        self.assertEqual(K.parse_command("/ksk"), {"action": "start", "title": None})
+        self.assertEqual(K.parse_command("/ksk"), {"action": "start", "title": "/ksk"})
 
     def test_fullwidth_is_normalized_by_nfkc(self):
-        self.assertEqual(K.parse_command("！ｋｓｋ"), {"action": "start", "title": None})
-        self.assertEqual(K.parse_command("／ｋｓｋ"), {"action": "start", "title": None})
+        # 表記ゆれ(全角)があっても表示は半角の綺麗な形に揃える
+        self.assertEqual(K.parse_command("！ｋｓｋ"), {"action": "start", "title": "!ksk"})
+        self.assertEqual(K.parse_command("／ｋｓｋ"), {"action": "start", "title": "/ksk"})
 
     def test_case_insensitive(self):
-        self.assertEqual(K.parse_command("!KSK"), {"action": "start", "title": None})
+        self.assertEqual(K.parse_command("!KSK"), {"action": "start", "title": "!ksk"})
 
     def test_title_is_captured(self):
         self.assertEqual(
@@ -48,22 +51,23 @@ class ParseCommandTest(unittest.TestCase):
         for phrase in K.EXTRA_TRIGGER_PHRASES:
             with self.subTest(phrase=phrase):
                 self.assertEqual(
-                    K.parse_command(phrase), {"action": "start", "title": None})
+                    K.parse_command(phrase), {"action": "start", "title": phrase})
 
     def test_extra_trigger_phrase_embedded_in_a_sentence(self):
         self.assertEqual(
             K.parse_command("今日は加速チャレンジやります！"),
-            {"action": "start", "title": None},
+            {"action": "start", "title": "加速チャレンジ"},
         )
         self.assertEqual(
             K.parse_command("みんなで連投チャレンジしよう"),
-            {"action": "start", "title": None},
+            {"action": "start", "title": "連投チャレンジ"},
         )
 
-    def test_extra_trigger_phrase_title_is_always_none(self):
-        # !ksk と違い、後ろの文字列をタイトルとして拾わない
+    def test_extra_trigger_phrase_ignores_trailing_text(self):
+        # !ksk と違い、後ろの文字列をタイトルとして拾わない。
+        # マッチしたフレーズそのものをタイトルにする
         got = K.parse_command("kskチャレンジ 深夜の部やります")
-        self.assertIsNone(got["title"])
+        self.assertEqual(got["title"], "kskチャレンジ")
 
     def test_owari_inside_a_sentence_does_not_stop(self):
         # 「終了」は普通の日本語なので、行全体が終了のときだけ発火させる。
@@ -80,10 +84,10 @@ class ParseCommandTest(unittest.TestCase):
     def test_command_anywhere_in_the_text(self):
         # 仕様は「本文に含まれていれば登録」。行頭限定ではない
         self.assertEqual(
-            K.parse_command("加速するぞ /ksk"), {"action": "start", "title": None}
+            K.parse_command("加速するぞ /ksk"), {"action": "start", "title": "/ksk"}
         )
         self.assertEqual(
-            K.parse_command("こんばんは\n!ksk"), {"action": "start", "title": None}
+            K.parse_command("こんばんは\n!ksk"), {"action": "start", "title": "!ksk"}
         )
 
     def test_title_is_the_rest_of_the_same_line(self):

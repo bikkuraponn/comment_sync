@@ -238,12 +238,39 @@ class BuildPayloadTest(unittest.TestCase):
         ]
 
     def test_shares_and_others(self):
-        q1 = self._q1(12, per=10)  # 合計120件、上位8のみ individual
+        extra = 4
+        n = K.TOP_ACCOUNTS + extra
+        q1 = self._q1(n, per=10)  # 上位 TOP_ACCOUNTS のみ accounts に individual で載る
         payload = K.build_payload(self._thread(), q1, [], [], {}, now_epoch=1_000_600)
         self.assertEqual(len(payload["accounts"]), K.TOP_ACCOUNTS)
-        self.assertEqual(payload["others"], {"count": 40, "accounts": 4})
-        self.assertEqual(payload["unique_accounts"], 12)
-        self.assertAlmostEqual(payload["accounts"][0]["share"], 10 / 120)
+        self.assertEqual(payload["others"], {"count": extra * 10, "accounts": extra})
+        self.assertEqual(payload["unique_accounts"], n)
+        self.assertAlmostEqual(payload["accounts"][0]["share"], 10 / (n * 10))
+
+    def test_all_accounts_includes_everyone_not_just_top(self):
+        extra = 4
+        n = K.TOP_ACCOUNTS + extra
+        q1 = self._q1(n, per=10)
+        payload = K.build_payload(self._thread(), q1, [], [], {}, now_epoch=1)
+        self.assertEqual(len(payload["all_accounts"]), n)
+        self.assertEqual(
+            {a["channel_id"] for a in payload["all_accounts"]},
+            {r["author_channel_id"] for r in q1},
+        )
+
+    def test_all_accounts_have_peak_per_min_even_beyond_top(self):
+        # peak_per_min は表(全員)にも使うので、上位に入らないアカウントでも
+        # ちゃんと計算されていること(以前は上位ぶんしか計算していなかった)
+        extra = 2
+        n = K.TOP_ACCOUNTS + extra
+        q1 = self._q1(n, per=1)
+        last_cid = q1[-1]["author_channel_id"]
+        q2 = [{"m": 100, "author_channel_id": last_cid, "c": 9}]
+        payload = K.build_payload(self._thread(), q1, q2, [], {}, now_epoch=1)
+        entry = next(a for a in payload["all_accounts"] if a["channel_id"] == last_cid)
+        self.assertEqual(entry["peak_per_min"], 9)
+        # 円グラフ用の accounts には(上位ではないので)含まれない
+        self.assertNotIn(last_cid, [a["channel_id"] for a in payload["accounts"]])
 
     def test_remaining_and_discrepancy(self):
         q1 = self._q1(1, per=100)

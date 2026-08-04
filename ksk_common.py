@@ -110,9 +110,10 @@ MAX_REPLY_PAGES = 15
 KSK_MAX_DEAD_RATIO = 0.5
 KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD = 5
 
-# payload に個別に載せるアカウント数。残りは "others" に畳む
-# (円グラフのスライス数と payload サイズの両方の都合)。
-TOP_ACCOUNTS = 8
+# 円グラフ・速度グラフに個別の色で載せるアカウント数。残りは "others" に畳む
+# (色パレット(flaskr/public/static/ksk.js の COLORS)の数・スライスの見やすさが
+# 上限。表(all_accounts)は絞らず全員載せるので、ここは「グラフに乗る人数」の話に限る)。
+TOP_ACCOUNTS = 15
 
 # 速度系列を1分バケットで持つ上限。超えたら5分バケットにダウンサンプルする。
 SPEED_MINUTE_BUCKET_LIMIT = 120
@@ -431,8 +432,13 @@ def _downsample(series: list[int], factor: int) -> list[int]:
     return out
 
 
-def build_speed(q2_rows: list[dict], top_ids: list[str]) -> tuple[dict, dict[str, int]]:
+def build_speed(q2_rows: list[dict], all_ids: list[str]) -> tuple[dict, dict[str, int]]:
     """Q2 の (分バケット, アカウント, 件数) から速度系列を組み立てる。
+
+    all_ids: そのスレッドの全アカウント(上位に限らない)。peak_per_min は
+    表(参加アカウント、全員表示)にも使うため全員ぶん計算する必要がある
+    (円グラフ・速度グラフに埋め込む時系列は、呼び出し側で上位ぶんだけに
+    絞り込む — payloadが不必要に膨らまないようにするため)。
 
     戻り値: (speed dict, {channel_id: そのアカウントの最大 rpm})
     バケット数が SPEED_MINUTE_BUCKET_LIMIT を超えたら5分バケットにダウンサンプルする。
@@ -445,7 +451,7 @@ def build_speed(q2_rows: list[dict], top_ids: list[str]) -> tuple[dict, dict[str
     n = m1 - m0 + 1
 
     total = [0] * n
-    per_account: dict[str, list[int]] = {cid: [0] * n for cid in top_ids}
+    per_account: dict[str, list[int]] = {cid: [0] * n for cid in all_ids}
     peak_per_min: dict[str, int] = {}
 
     for r in q2_rows:
@@ -486,12 +492,19 @@ def build_payload(
     """ksk_thread_stats.payload を組み立てる。
 
     thread: ksk_threads の1行相当
-    q1_rows: Q1_ACCOUNTS_SQL の結果(件数降順)
-    q2_rows: Q2_MINUTE_BUCKETS_SQL の結果
-    gap_rows: q3_gap_stats_sql() の結果(上位アカウントのみ)
-    median_gap_by_channel: {channel_id: 中央値秒}(上位アカウントのみ)
+    q1_rows: Q1_ACCOUNTS_SQL の結果(件数降順、全アカウント)
+    q2_rows: Q2_MINUTE_BUCKETS_SQL の結果(全アカウント)
+    gap_rows: q3_gap_stats_sql() の結果(全アカウント)
+    median_gap_by_channel: {channel_id: 中央値秒}(全アカウント)
     total_reply_count: Pass1 で得た YouTube 側の返信数。取得件数との差を
       count_discrepancy として出すために使う(1000件上限や結果整合で乖離し得る)。
+
+    payload には2種類のアカウント一覧を持つ:
+      accounts     … 上位 TOP_ACCOUNTS 件のみ。円グラフ・速度グラフの内訳用
+                      (これ以上載せてもグラフが読めなくなるので絞る)
+      all_accounts … 全アカウント。「参加アカウント」表用(絞らない —
+                      複数アカウントを使った連投を見るのがこの機能の目的なので、
+                      2番手以降を「ほか」に畳んで隠すのは本末転倒)
     """
     now = int(now_epoch if now_epoch is not None else time.time())
     fetched_count = sum(int(r["c"]) for r in q1_rows)
@@ -499,16 +512,24 @@ def build_payload(
 
     top_rows = q1_rows[:TOP_ACCOUNTS]
     top_ids = [r["author_channel_id"] for r in top_rows]
-    speed, peak_per_min = build_speed(q2_rows, top_ids)
+    all_ids = [r["author_channel_id"] for r in q1_rows]
+
+    full_speed, peak_per_min = build_speed(q2_rows, all_ids)
+    # 円グラフ・速度グラフに埋め込む時系列は上位ぶんだけに絞る。全員ぶん載せると
+    # payloadが不必要に膨らみ、グラフ自体も読めなくなる
+    # (peak_per_min は表(全員)にも使うのでフル計算のまま持っておく、上の注記参照)。
+    # q2_rows が空の場合 build_speed() は by_account={} を早期returnするので、
+    # .get() で欠損に備える(そのアカウントの時系列が単に無い=0件と同義)。
+    full_by_account = full_speed.get("by_account", {})
+    speed = dict(full_speed, by_account={cid: full_by_account.get(cid, []) for cid in top_ids})
 
     gap_by_channel = {r["author_channel_id"]: r for r in gap_rows}
 
-    accounts = []
-    for r in top_rows:
+    def _account_entry(r: dict) -> dict:
         cid = r["author_channel_id"]
         c = int(r["c"])
         g = gap_by_channel.get(cid) or {}
-        accounts.append({
+        return {
             "channel_id": cid,
             "handle": r.get("handle"),
             "count": c,
@@ -519,7 +540,10 @@ def build_payload(
             "min_gap_sec": int(g["min_gap"]) if g.get("min_gap") is not None else None,
             "same_second_pairs": int(g.get("same_second_pairs") or 0),
             "peak_per_min": peak_per_min.get(cid, 0),
-        })
+        }
+
+    accounts = [_account_entry(r) for r in top_rows]
+    all_accounts = [_account_entry(r) for r in q1_rows]
 
     rest = q1_rows[TOP_ACCOUNTS:]
     others = {
@@ -556,6 +580,7 @@ def build_payload(
         "unique_accounts": len(q1_rows),
         "count_discrepancy": reply_count - fetched_count,
         "accounts": accounts,
+        "all_accounts": all_accounts,
         "others": others,
         "speed": speed,
     }

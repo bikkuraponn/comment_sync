@@ -1436,6 +1436,26 @@ def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
         changed += 1 + n_ended
         print(f"  ksk 自動BAN: {cid} ({reason}) 稼働中スレッド{n_ended}件を終了", flush=True)
 
+    # 5分スキャン単発の閾値だけでなく、もう少し長い10分の窓でも絶対件数を見て
+    # 自動BANする（AUTO_BAN_THREADS_PER_SCANの注記どおり、スキャン間隔をわずかに
+    # 超えて分散して打たれた連投を拾うため）。このスキャンで1件以上検知した
+    # アカウントだけを対象に1クエリ確認すればよく、ksk自体が稀なので
+    # 毎分の実コストへの影響はほぼ無い。
+    for cid in sorted(scan_counts):
+        if cid in banned:
+            continue
+        count = ksk_common.count_recent_trigger_threads(client, cid, now_epoch)
+        if count < ksk_common.TRIGGER_BAN_THRESHOLD:
+            continue
+        reason = (f"auto: {count} ksk trigger threads in "
+                  f"{ksk_common.TRIGGER_BAN_WINDOW_MIN}min window at {now_epoch}")
+        ksk_common.add_ban(client, cid, reason, now_epoch)
+        banned.add(cid)
+        n_ended = ksk_common.end_threads_of_owner(
+            client, cid, ksk_common.REASON_BANNED, now_epoch)
+        changed += 1 + n_ended
+        print(f"  ksk 自動BAN(10分閾値): {cid} ({reason}) 稼働中スレッド{n_ended}件を終了", flush=True)
+
     # 解除コマンドは絞り込み前の全候補から拾う（返信として打たれるため、
     # select_start_candidates() が落とした行にも含まれ得る）。
     for row, cmd in candidates:

@@ -559,6 +559,65 @@ class KskAutoBanTest(unittest.TestCase):
         self.assertEqual(row["ended_reason"], "banned")
 
 
+class KskTriggerWindowBanTest(unittest.TestCase):
+    """DETECT_WINDOW_MIN(5分)の単発スキャンには収まらない、もう少し長い
+    TRIGGER_BAN_WINDOW_MIN(10分)の絶対件数での自動BAN(2026-08-04追加)。
+
+    5分ごとのスキャンでは閾値未満に見える(1分1件ペースの連投など)が、
+    10分通算では TRIGGER_BAN_THRESHOLD 件に達するケースを狙う。
+    """
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, published_at INTEGER, text TEXT, "
+            "is_deleted INTEGER DEFAULT 0)"
+        )
+
+    def _post(self, comment_id, author, text, parent_id=None, published_at=1_000_000):
+        self.client.execute(
+            "INSERT INTO comments(comment_id,parent_id,author_channel_id,handle,published_at,text) "
+            "VALUES(?,?,?,?,?,?)",
+            [comment_id, parent_id, author, "@" + author, published_at, text],
+        )
+
+    def _bans(self):
+        return {r["channel_id"]: r["reason"]
+                for r in self.client.query("SELECT channel_id, reason FROM ksk_bans")}
+
+    def test_spread_out_spam_is_banned_by_the_10min_absolute_count(self):
+        # 直近5分スキャン(DETECT_WINDOW_MIN)には1件しか入らないが、10分通算では
+        # ちょうど閾値(TRIGGER_BAN_THRESHOLD)件になるように仕込む。
+        now = 1_000_600
+        n_old = ksk_common.TRIGGER_BAN_THRESHOLD - 1
+        for i in range(n_old):
+            self._post(f"old{i}", "UC_spam", "!ksk", published_at=1_000_000 + i)
+        # 直近5分スキャンに入る1件だけを追加(now-300 以降)
+        self._post("recent", "UC_spam", "!ksk", published_at=1_000_310)
+
+        sync.check_ksk_commands(self.client, now)
+
+        self.assertIn("UC_spam", self._bans())
+        self.assertIn(str(ksk_common.TRIGGER_BAN_THRESHOLD), self._bans()["UC_spam"])
+        active = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual(active, [], "BANされたアカウントのスレッドは登録されない")
+
+    def test_below_the_10min_threshold_is_not_banned(self):
+        now = 1_000_600
+        n_old = ksk_common.TRIGGER_BAN_THRESHOLD - 2
+        for i in range(n_old):
+            self._post(f"old{i}", "UC_ok", "!ksk", published_at=1_000_000 + i)
+        self._post("recent", "UC_ok", "!ksk", published_at=1_000_310)
+
+        sync.check_ksk_commands(self.client, now)
+
+        self.assertEqual(self._bans(), {})
+        active = self.client.query("SELECT thread_id FROM ksk_threads WHERE state = 'active'")
+        self.assertEqual([r["thread_id"] for r in active], ["recent"])
+
+
 class KskDeadRatioTrackingTest(unittest.TestCase):
     """run_ksk_tracking() が Pass1 の消滅判定に安全弁を持つことを固定する(2026-08-03追加)。
 

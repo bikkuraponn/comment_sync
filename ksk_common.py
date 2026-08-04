@@ -74,6 +74,16 @@ MAX_REGISTRATIONS_PER_DAY = 3
 # そのため閾値は「明らかに機械的な連投」と言える水準に置き、BANの理由文へ
 # 件数と根拠を残して後から人手で取り消せるようにしている(ksk_bans から DELETE)。
 AUTO_BAN_THREADS_PER_SCAN = 4
+
+# 上のAUTO_BAN_THREADS_PER_SCANは1回の窓スキャン(=直近5分)の中でしか見ないため、
+# ちょうどそのスキャン間隔をわずかに超えるペースで分散して打たれた連投は
+# 単発のスキャンでは閾値に届かず素通りし得る(例: 1分ごとに1件、10分で12件のペース
+# だと5分スキャンには最大でも5〜6件しか映らない)。そこで author_channel_id ごとに
+# もう少し長い時間軸(TRIGGER_BAN_WINDOW_MIN分)での絶対件数も別途チェックする。
+# ユーザー指定: 10分間に12件以上ならBAN。
+TRIGGER_BAN_WINDOW_MIN = 10
+TRIGGER_BAN_THRESHOLD = 12
+
 # 返信がこの件数に達するまで T2(返信の完全取得)を起動しない。
 # 誰も乗らなかった `!ksk` が API units を食わないようにするため
 # (T1 の Pass1 は全 active スレッド合計で1 unit なので、放置しても実質無料)。
@@ -386,6 +396,37 @@ def jst_day_start_epoch(now_epoch: int) -> int:
 def detect_window_bounds(now_epoch: int) -> tuple[int, int]:
     """T0 が毎分スキャンする [start, end) の epoch 秒。"""
     return now_epoch - DETECT_WINDOW_MIN * 60, now_epoch
+
+
+def trigger_ban_window_bounds(now_epoch: int) -> tuple[int, int]:
+    """10分閾値の自動BAN判定で見る [start, end) の epoch 秒。"""
+    return now_epoch - TRIGGER_BAN_WINDOW_MIN * 60, now_epoch
+
+
+def count_recent_trigger_threads(client: TursoClient, channel_id: str, now_epoch: int) -> int:
+    """そのアカウントが直近 TRIGGER_BAN_WINDOW_MIN 分に立てた、登録コマンド入りの
+    親コメント(スレッド)の件数。
+
+    `WHERE author_channel_id = ? AND published_at >= ? AND published_at < ?` は
+    idx_comments_author_published (author_channel_id, published_at) の SEARCH になる
+    ――account_profile_updater.rebuild_profile() と同じ、この索引の意図した使い方
+    (AGENTS.md 参照)。トリガー文字列の判定は SQL では出来ないので、対象アカウントの
+    直近ぶんの本文だけを読んで Python 側で parse_command() にかける。呼び出し元が
+    「このスキャンで1件以上検知したアカウントだけ」に絞ってから呼ぶので、
+    毎分の追加コストは無視できる小さい件数になる。
+    """
+    start_epoch, end_epoch = trigger_ban_window_bounds(now_epoch)
+    rows = client.query(
+        "SELECT text FROM comments WHERE author_channel_id = ? "
+        "AND published_at >= ? AND published_at < ? AND parent_id IS NULL",
+        [channel_id, start_epoch, end_epoch],
+    )
+    count = 0
+    for row in rows:
+        cmd = parse_command(row.get("text"))
+        if cmd is not None and cmd.get("action") == ACTION_START:
+            count += 1
+    return count
 
 
 # ------------------------------------------------------------------ #

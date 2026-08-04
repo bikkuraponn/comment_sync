@@ -125,6 +125,27 @@ SPEED_MINUTE_BUCKET_LIMIT = 120
 # その1行の読み書きコストと payload サイズが両方膨らむ。
 INDEX_PAST_LIMIT = 30
 
+# ------------------------------------------------------------------ #
+# 休眠中(ended)スレッドの復活検知
+#
+# Pass2 は active なスレッドにしか走らないため、一度 ended になると
+# ksk_thread_stats の payload は二度と自動更新されない。アイドルタイムアウト
+# (30分)後に遅れて数件だけ返信が付くケースは普通に起き得るが、これまでは
+# 検知する手段が無く、ページは古いまま固まって表示され続けていた。
+#
+# check_dormant_ksk_threads() が低頻度(1時間おき)で、直近 ended のスレッドの
+# comments 上の実返信数を last_reply_count と比較し、増えていたら:
+#   増加分 < DORMANT_REACTIVATE_THRESHOLD → 内訳だけ再集計、state は ended のまま
+#   増加分 >= DORMANT_REACTIVATE_THRESHOLD → active に戻し、以後は通常の
+#     Pass1/Pass2 サイクルに合流する(evaluate_end_reason() の REPLY_CAP/
+#     MAX_DURATION_SEC が started_at 基準で効くので、6時間経過済みなら
+#     次のPass1で即座に ended へ戻る = 枠を永久に占有する心配は無い)
+#
+# 閾値はユーザーの勘による初期値。実データで「終了後どれくらい遅れて
+# 何件付くか」の分布を見てから調整する想定。
+DORMANT_REACTIVATE_THRESHOLD = 10
+DORMANT_CHECK_LIMIT = INDEX_PAST_LIMIT
+
 STATE_ACTIVE = "active"
 STATE_ENDED = "ended"
 
@@ -697,6 +718,49 @@ def end_thread(turso: TursoClient, thread_id: str, reason: str, now_epoch: int) 
         "UPDATE ksk_threads SET state = ?, ended_at = ?, ended_reason = ?, updated_at = ? "
         "WHERE thread_id = ? AND state = ?",
         [STATE_ENDED, now_epoch, reason, now_epoch, thread_id, STATE_ACTIVE],
+    )
+
+
+def classify_dormant_growth(increase: int) -> str:
+    """ended スレッドの返信増加分から次のアクションを判定する(純関数)。
+
+    戻り値: "none"(何もしない) / "reaggregate"(内訳だけ再集計) / "reactivate"(activeに戻す)
+    """
+    if increase <= 0:
+        return "none"
+    if increase >= DORMANT_REACTIVATE_THRESHOLD:
+        return "reactivate"
+    return "reaggregate"
+
+
+def count_current_replies(turso: TursoClient, thread_id: str) -> int:
+    """そのスレッドの comments 上の現在の生存返信数(is_deleted=0)。"""
+    rows = turso.query(
+        "SELECT COUNT(*) AS c FROM comments WHERE parent_id = ? AND is_deleted = 0",
+        [thread_id],
+    )
+    return int(rows[0]["c"]) if rows else 0
+
+
+def update_last_reply_count(turso: TursoClient, thread_id: str, reply_count: int, now_epoch: int) -> None:
+    """state を変えずに last_reply_count だけ更新する(再集計のみのケース用)。"""
+    turso.execute(
+        "UPDATE ksk_threads SET last_reply_count = ?, updated_at = ? WHERE thread_id = ?",
+        [reply_count, now_epoch, thread_id],
+    )
+
+
+def reactivate_thread(turso: TursoClient, thread_id: str, now_epoch: int) -> None:
+    """ended スレッドを active に戻す。既に active なら何もしない。
+
+    last_growth_at を「今」に更新するのが要点 — 忘れると evaluate_end_reason() の
+    アイドル判定(30分)が古い値のままなので、復活しても次のPass1で即座に
+    ended(idle) へ逆戻りしてしまう。
+    """
+    turso.execute(
+        "UPDATE ksk_threads SET state = ?, ended_at = NULL, ended_reason = NULL, "
+        "last_growth_at = ?, updated_at = ? WHERE thread_id = ? AND state = ?",
+        [STATE_ACTIVE, now_epoch, now_epoch, thread_id, STATE_ENDED],
     )
 
 

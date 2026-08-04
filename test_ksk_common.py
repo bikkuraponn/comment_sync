@@ -539,5 +539,19 @@ class DeadRatioIsSuspectTest(unittest.TestCase):
         self.assertTrue(K.dead_ratio_is_suspect(K.KSK_MIN_BATCH_FOR_DEAD_RATIO_GUARD, 3))
 
 
+class ClassifyDormantGrowthTest(unittest.TestCase):
+    def test_no_growth_is_none(self):
+        self.assertEqual(K.classify_dormant_growth(0), "none")
+        self.assertEqual(K.classify_dormant_growth(-1), "none")
+
+    def test_small_growth_is_reaggregate(self):
+        self.assertEqual(K.classify_dormant_growth(1), "reaggregate")
+        self.assertEqual(K.classify_dormant_growth(K.DORMANT_REACTIVATE_THRESHOLD - 1), "reaggregate")
+
+    def test_large_growth_is_reactivate(self):
+        self.assertEqual(K.classify_dormant_growth(K.DORMANT_REACTIVATE_THRESHOLD), "reactivate")
+        self.assertEqual(K.classify_dormant_growth(K.DORMANT_REACTIVATE_THRESHOLD + 100), "reactivate")
+
+
 if __name__ == "__main__":
     unittest.main()

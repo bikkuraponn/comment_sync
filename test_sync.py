@@ -635,5 +635,95 @@ class KskDeadRatioTrackingTest(unittest.TestCase):
         self.assertEqual(states["Ugy_b"], "ended")
 
 
+class CheckDormantKskThreadsTest(unittest.TestCase):
+    """check_dormant_ksk_threads() が ended スレッドの復活を検知することを固定する
+    (2026-08-04追加)。Pass2はactiveにしか走らないため、これが無いとアイドル
+    タイムアウト後に遅れて付いた返信に永久に気づけない。
+    """
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, published_at INTEGER, "
+            "like_count INTEGER, is_pinned INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, "
+            "deleted_confirmed_at INTEGER, fetched_at INTEGER, reply_order INTEGER, "
+            "thread_published_at INTEGER, original_text TEXT, text TEXT)"
+        )
+        ksk_common.ensure_schema(self.client)
+
+    def _end_thread(self, thread_id, owner, last_reply_count, started_at=1_000_000):
+        ksk_common.register_thread(self.client, thread_id, owner, "@x", None, started_at, started_at)
+        ksk_common.update_pass1_progress(self.client, thread_id, last_reply_count, started_at, True)
+        ksk_common.end_thread(self.client, thread_id, ksk_common.REASON_IDLE, started_at + 10)
+
+    def _add_replies(self, thread_id, n, start_ts=2_000_000):
+        for i in range(n):
+            self.client.execute(
+                "INSERT INTO comments(comment_id,parent_id,author_channel_id,handle,published_at,is_deleted) "
+                "VALUES(?,?,?,?,?,0)",
+                [f"{thread_id}_r{i}", thread_id, "UC_replier", "@replier", start_ts + i],
+            )
+
+    def _row(self, thread_id):
+        return self.client.query("SELECT * FROM ksk_threads WHERE thread_id=?", [thread_id])[0]
+
+    def test_no_growth_does_nothing(self):
+        self._end_thread("Ugy_a", "UC_owner", last_reply_count=0)
+        n = sync.check_dormant_ksk_threads(self.client, 3_000_000)
+        self.assertEqual(n, 0)
+        self.assertEqual(self._row("Ugy_a")["state"], "ended")
+
+    def test_small_growth_reaggregates_but_stays_ended(self):
+        self._end_thread("Ugy_a", "UC_owner", last_reply_count=0)
+        self._add_replies("Ugy_a", ksk_common.DORMANT_REACTIVATE_THRESHOLD - 1)
+
+        n = sync.check_dormant_ksk_threads(self.client, 3_000_000)
+
+        self.assertEqual(n, 1)
+        row = self._row("Ugy_a")
+        self.assertEqual(row["state"], "ended")
+        self.assertEqual(row["last_reply_count"], ksk_common.DORMANT_REACTIVATE_THRESHOLD - 1)
+        stats = self.client.query("SELECT payload FROM ksk_thread_stats WHERE thread_id=?", ["Ugy_a"])
+        self.assertEqual(len(stats), 1, "再集計でpayloadが書かれているはず")
+
+    def test_large_growth_reactivates_and_resets_growth_clock(self):
+        self._end_thread("Ugy_a", "UC_owner", last_reply_count=0)
+        self._add_replies("Ugy_a", ksk_common.DORMANT_REACTIVATE_THRESHOLD)
+
+        n = sync.check_dormant_ksk_threads(self.client, 3_000_000)
+
+        self.assertEqual(n, 1)
+        row = self._row("Ugy_a")
+        self.assertEqual(row["state"], "active")
+        self.assertIsNone(row["ended_reason"])
+        self.assertIsNone(row["ended_at"])
+        # last_growth_at を復活時刻に更新していないと、次のPass1のアイドル判定が
+        # 古い値のままで即座に ended(idle) へ逆戻りしてしまう
+        self.assertEqual(row["last_growth_at"], 3_000_000)
+
+    def test_reactivation_respects_max_active_threads(self):
+        # 既に上限まで active が埋まっていたら、閾値を超えていても再集計だけに留める
+        for i in range(ksk_common.MAX_ACTIVE_THREADS):
+            ksk_common.register_thread(
+                self.client, f"Ugy_active_{i}", f"UC_active_{i}", "@x", None, 1_000_000, 1_000_000,
+            )
+        self._end_thread("Ugy_a", "UC_owner", last_reply_count=0)
+        self._add_replies("Ugy_a", ksk_common.DORMANT_REACTIVATE_THRESHOLD)
+
+        sync.check_dormant_ksk_threads(self.client, 3_000_000)
+
+        self.assertEqual(self._row("Ugy_a")["state"], "ended",
+                          "枠が無いので active に戻さず再集計だけのはず")
+
+    def test_only_checks_recent_ended_threads(self):
+        # DORMANT_CHECK_LIMIT を超える古い ended は対象外(get_recent_threads と同じ範囲)
+        for i in range(ksk_common.DORMANT_CHECK_LIMIT + 2):
+            self._end_thread(f"Ugy_{i}", f"UC_{i}", last_reply_count=0, started_at=1_000_000 + i)
+        n = sync.check_dormant_ksk_threads(self.client, 3_000_000)
+        self.assertEqual(n, 0)  # 誰も返信が増えていないので0件だが、例外なく完走することを確認
+
+
 if __name__ == "__main__":
     unittest.main()

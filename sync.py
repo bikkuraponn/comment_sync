@@ -4,6 +4,7 @@
 実行する処理:
   毎分    : sync_new_comments()        新しく立ったスレッドとその返信を取得
   毎分    : check_ksk_commands()       ksk(加速)スレッドの登録/解除コマンド検出(YouTube API不使用)
+  1時間おき: check_dormant_ksk_threads() ended な ksk スレッドの復活検知(YouTube API不使用)
   10分おき : run_reply_recheck_batch()  コールド層(全履歴のカーソル巡回)
   30分おき : 同上 + ホット層(直近24時間のスレッド全件)
 
@@ -1748,6 +1749,48 @@ def run_ksk_tracking(client: TursoClient, now_epoch: int, deadline: float) -> in
     return changed
 
 
+def check_dormant_ksk_threads(client: TursoClient, now_epoch: int) -> int:
+    """ended な ksk スレッドが後から復活していないか低頻度でチェックする。
+
+    Pass2 は active にしか走らないため、一度 ended になった payload は
+    二度と自動更新されない。アイドルタイムアウト後に遅れて数件だけ返信が
+    付くケースを拾えるようにする(YouTube APIは一切使わない — comments の
+    件数比較だけで済む)。戻り値は状態が変わった(再集計 or 復活)件数。
+    """
+    threads = ksk_common.get_recent_threads(client, limit=ksk_common.DORMANT_CHECK_LIMIT)
+    if not threads:
+        return 0
+
+    active_count = len(ksk_common.get_threads_by_state(client, ksk_common.STATE_ACTIVE))
+    changed = 0
+
+    for thread in threads:
+        tid = thread["thread_id"]
+        current = ksk_common.count_current_replies(client, tid)
+        increase = current - int(thread.get("last_reply_count") or 0)
+        action = ksk_common.classify_dormant_growth(increase)
+        if action == "none":
+            continue
+
+        if action == "reactivate" and active_count < ksk_common.MAX_ACTIVE_THREADS:
+            ksk_common.reactivate_thread(client, tid, now_epoch)
+            active_count += 1
+            changed += 1
+            print(f"  ksk 復活: {tid} 返信+{increase}件 → active に復帰", flush=True)
+            continue
+
+        # 復活の枠が無い、または閾値未満 → 内訳だけ再集計して ended のまま
+        snapshot = dict(thread)
+        _ksk_refresh_stats(client, snapshot, current, now_epoch)
+        ksk_common.update_last_reply_count(client, tid, current, now_epoch)
+        changed += 1
+        print(f"  ksk 休眠中に返信+{increase}件検知、再集計: {tid}", flush=True)
+
+    if changed:
+        _write_ksk_index(client, now_epoch)
+    return changed
+
+
 # ------------------------------------------------------------------ #
 # エントリポイント
 # ------------------------------------------------------------------ #
@@ -1829,6 +1872,17 @@ def main():
             print(f"  ksk 追跡更新: {n_track} 件")
     except Exception as e:
         print(f"  ksk追跡エラー: {e}", flush=True)
+
+    # 1時間おき: ended な ksk スレッドが後から復活していないかチェック。
+    # YouTube APIを使わずTursoの件数比較だけで済むので、他の処理と違って
+    # 頻繁に回す理由が無い(アイドルタイムアウト自体が30分単位のため)。
+    if now.minute == 0:
+        try:
+            n_dormant = check_dormant_ksk_threads(client, int(now.timestamp()))
+            if n_dormant:
+                print(f"  ksk 休眠チェック: {n_dormant} 件")
+        except Exception as e:
+            print(f"  ksk休眠チェックエラー: {e}", flush=True)
 
     # 10分おき: コールド層(全履歴のカーソル巡回)だけ
     # 30分おき: それに加えてホット層(直近24時間のスレッド全件)も見る

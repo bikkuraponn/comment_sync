@@ -15,7 +15,8 @@ Turso アクセス関数を分けてあり、純関数側は YouTube/Turso 非�
 切り出したのと同じ理由)。
 
 3層構成(詳細は計画書):
-  T0 検出: 毎分、直近 DETECT_WINDOW_MIN 分の comments を再スキャンして `!ksk` を検出。
+  T0 検出: 毎分、前回スキャンし終えた地点(カーソル)から今回時刻までの comments を
+           再スキャンして `!ksk` を検出(2026-08-05〜、detect_window_bounds() 参照)。
            YouTube API 消費ゼロ。この層だけで登録・解除が完結する。
   T1 速度: active スレッドがある分だけ Pass1(commentThreads.list(id=), 50件で1 unit)を
            投げ、totalReplyCount の毎分差分を連投速度にする。
@@ -43,10 +44,30 @@ JST = ZoneInfo("Asia/Tokyo")
 # 定数
 # ------------------------------------------------------------------ #
 
-# T0 が毎分再スキャンする窓。1回きりのスキャンだと YouTube 側のコメント反映遅延で
+# T0 が毎分再スキャンする窓の基準値。1回きりのスキャンだと YouTube 側のコメント反映遅延で
 # 取りこぼす(time_comment_common の TIME_COMMENT_CHECK_WINDOW_MIN=5 と同じ理由)。
 # 登録は thread_id の PK 冪等なので、同じ窓を何度見ても副作用はない。
+#
+# 2026-08-05: T0 はカーソル方式に変更した(detect_window_bounds() 参照)ため、
+# 通常運用でこの値が実際のスキャン窓幅になることは無い(前回スキャン済みの地点から
+# 今回時刻まで、が実際の窓になる)。この値は今も (1) カーソルが無い初回スキャン時の
+# フォールバック窓、(2) AUTO_BAN_THREADS_PER_SCAN 判定で「直近何分ぶんを見るか」の
+# 基準、の2箇所に残る。
 DETECT_WINDOW_MIN = 5
+
+# カーソルがどれだけ古くても、1回のスキャンで遡る幅はここで頭打ちにする。
+#
+# 背景(2026-08-05): GitHub Actions の concurrency 設定(group単位でpendingは1本のみ、
+# cancel-in-progress: false)下では、1本のrunが長時間(スレッド巡回チェック等で
+# 5分以上)かかると、待機中の後続run群がまとめてcancelledされることが実際に起きる
+# (実例: 17:59台に1本が5分29秒かかり、続く4分ぶんのrunが全てcancelled)。
+# 固定DETECT_WINDOW_MIN分の窓だと、publishからスキャンまでのラグがこの窓を
+# 超えた分は「その窓を二度と見ない」ため恒久的に検出漏れになる(実際にこれで
+# 加速チャレンジの登録コメントが1件、22秒差で検出窓を外れて未登録のまま残った)。
+# カーソル方式は前回スキャン済みの地点から必ず再開するのでこの種の取りこぼしが
+# 起きないが、ワークフロー自体が長時間(数十分〜)止まっていた場合に無制限に
+# 遡ると idx_comments_published の SEARCH 行数が際限なく膨らむため上限を設ける。
+DETECT_WINDOW_MAX_CATCHUP_MIN = 60
 
 TITLE_MAX_LEN = 40
 
@@ -228,6 +249,16 @@ _TABLES_SQL = [
       updated_at INTEGER NOT NULL
     )
     """,
+    # T0(check_ksk_commands)のスキャン済みカーソル(2026-08-05追加)。ksk_state
+    # (YouTube APIクォータ管理)とは無関係な独立の懸念事項なので別テーブルにする
+    # (reply_recheck_state/pinned_comment_state と同じ、1状態1テーブルの流儀)。
+    """
+    CREATE TABLE IF NOT EXISTS ksk_detect_state (
+      id                   INTEGER PRIMARY KEY CHECK (id = 1),
+      cursor_published_at  INTEGER NOT NULL,
+      updated_at           INTEGER NOT NULL
+    )
+    """,
 ]
 
 
@@ -393,9 +424,54 @@ def jst_day_start_epoch(now_epoch: int) -> int:
     return int(day_start.timestamp())
 
 
-def detect_window_bounds(now_epoch: int) -> tuple[int, int]:
-    """T0 が毎分スキャンする [start, end) の epoch 秒。"""
-    return now_epoch - DETECT_WINDOW_MIN * 60, now_epoch
+def detect_window_bounds(now_epoch: int, cursor: int | None = None) -> tuple[int, int]:
+    """T0 が今回スキャンする [start, end) の epoch 秒。
+
+    cursor は前回スキャンで実際に見終えた published_at の上限
+    (=前回呼び出しの end_epoch、ksk_detect_state.cursor_published_at)。
+    通常運用ではここから今回の now_epoch までを見るので、run が数分連続で
+    cancelled されても(2026-08-05の実インシデント、DETECT_WINDOW_MAX_CATCHUP_MIN
+    の注記参照)次に成功した run が取りこぼし無く拾える。
+
+    cursor が None(初回)、または now_epoch 以上(同一時刻での再呼び出し。
+    テストや、極端に短い間隔での呼び出しを想定)の場合は、従来どおり
+    DETECT_WINDOW_MIN 分の固定窓にフォールバックする(冪等性を保つ — 同じ窓を
+    何度見ても登録は thread_id の PK 冪等なので副作用が無い、という元々の設計を
+    そのまま活かす)。
+
+    カーソルが古すぎる場合は DETECT_WINDOW_MAX_CATCHUP_MIN 分で頭打ちにする
+    (それを超える長時間の欠測は、この機構だけでは救えない)。
+    """
+    if cursor is None or cursor >= now_epoch:
+        return now_epoch - DETECT_WINDOW_MIN * 60, now_epoch
+    start = max(cursor, now_epoch - DETECT_WINDOW_MAX_CATCHUP_MIN * 60)
+    return start, now_epoch
+
+
+def read_detect_cursor(turso: TursoClient) -> int | None:
+    """前回スキャンし終えた published_at の上限。まだ無ければ None(初回)。"""
+    rows = turso.query("SELECT cursor_published_at FROM ksk_detect_state WHERE id = 1")
+    if not rows:
+        return None
+    return int(rows[0]["cursor_published_at"])
+
+
+def write_detect_cursor(turso: TursoClient, cursor_published_at: int, now_epoch: int) -> None:
+    """今回スキャンし終えた地点までカーソルを進める。
+
+    コマンドが1件も見つからなかった場合(通常運用でほぼ毎回そう)でも必ず呼ぶこと —
+    ここを条件付きにすると、取りこぼした窓を毎回律儀に再スキャンし続けるだけで
+    カーソルが一向に前進せず、DETECT_WINDOW_MAX_CATCHUP_MIN で頭打ちにした意味が
+    無くなる(むしろ古い側の start が動かないまま end だけ伸び続け、窓が
+    無限に広がっていく)。
+    """
+    turso.execute(
+        "INSERT INTO ksk_detect_state (id, cursor_published_at, updated_at) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "cursor_published_at = excluded.cursor_published_at, "
+        "updated_at = excluded.updated_at",
+        [cursor_published_at, now_epoch],
+    )
 
 
 def trigger_ban_window_bounds(now_epoch: int) -> tuple[int, int]:

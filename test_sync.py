@@ -489,6 +489,113 @@ class KskCommandRegistrationTests(unittest.TestCase):
         self.assertEqual([r["thread_id"] for r in rows], ["t1"])
 
 
+class KskDetectCursorTest(unittest.TestCase):
+    """check_ksk_commands() のカーソル方式(2026-08-05追加)。
+
+    実インシデント: GitHub Actions の run が数分連続 cancelled され、投稿から
+    322秒後にTursoへ書き込まれた登録コメントが、当時の固定5分(300秒)窓を
+    22秒差で外れて検出漏れした。カーソル方式なら前回スキャン済みの地点から
+    再開するので、この種の取りこぼしが起きないことを固定する。
+    """
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, published_at INTEGER, text TEXT, "
+            "is_deleted INTEGER DEFAULT 0)"
+        )
+
+    def _post(self, comment_id, author, text, parent_id=None, published_at=1_000_000):
+        self.client.execute(
+            "INSERT INTO comments(comment_id,parent_id,author_channel_id,handle,published_at,text) "
+            "VALUES(?,?,?,?,?,?)",
+            [comment_id, parent_id, author, "@" + author, published_at, text],
+        )
+
+    def _active_owners(self):
+        rows = self.client.query(
+            "SELECT owner_channel_id FROM ksk_threads WHERE state = 'active'"
+        )
+        return [r["owner_channel_id"] for r in rows]
+
+    def test_comment_missed_by_a_stale_fixed_window_is_still_caught(self):
+        # 前回runが now=1_000_000 で走り、コマンドは何も無かった(カーソルは
+        # 1_000_000まで進む)。次にコマンド入りコメントが published_at=1_000_310
+        # (=前回now + 310秒、固定5分=300秒窓なら次のrunでも外れる位置)に投稿され、
+        # その327秒後(=DETECT_WINDOW_MIN*60+27秒後)にTursoへ反映されるケース。
+        sync.check_ksk_commands(self.client, 1_000_000)
+        self.assertEqual(self._active_owners(), [])
+
+        self._post("t1", "UC_a", "加速チャレンジ", published_at=1_000_310)
+        # 次のrunは1分後(now=1_000_060)。固定5分窓なら[999_760, 1_000_060)で
+        # t1(1_000_310)は未来なのでまだ見えない(正常)。
+        sync.check_ksk_commands(self.client, 1_000_060)
+        self.assertEqual(self._active_owners(), [])
+
+        # さらに数分、run が連続 cancelled されたと想定し、次に成功する run が
+        # now=1_000_400 まで飛ぶ(前回カーソル1_000_060から340秒の空白)。
+        # 固定5分窓なら[1_000_100, 1_000_400)でt1(1_000_310)は本来窓内だが、
+        # このテストの主眼は「窓がもっと開いていても跨いで拾える」こと。
+        sync.check_ksk_commands(self.client, 1_000_400)
+        self.assertEqual(self._active_owners(), ["UC_a"])
+
+    def test_cursor_advances_even_when_nothing_found(self):
+        sync.check_ksk_commands(self.client, 1_000_000)
+        cursor = ksk_common.read_detect_cursor(self.client)
+        self.assertEqual(cursor, 1_000_000)
+
+        sync.check_ksk_commands(self.client, 1_000_060)
+        self.assertEqual(ksk_common.read_detect_cursor(self.client), 1_000_060)
+
+    def test_gap_far_beyond_max_catchup_is_bounded_not_unbounded(self):
+        # カーソルが極端に古くても、遡る幅は DETECT_WINDOW_MAX_CATCHUP_MIN で
+        # 頭打ちになる(無制限に遡ってフルスキャン相当のコストにならないこと)。
+        sync.check_ksk_commands(self.client, 1_000_000)  # カーソルを1_000_000に固定
+        far_future = 1_000_000 + 10 * 3600
+
+        # 頭打ちラインより古い(=拾えないはずの)投稿
+        self._post("t_old", "UC_old", "!ksk", published_at=1_000_100)
+        # 頭打ちライン以内(=拾えるはずの)投稿
+        self._post("t_recent", "UC_recent", "!ksk", published_at=far_future - 100)
+
+        sync.check_ksk_commands(self.client, far_future)
+
+        self.assertEqual(
+            self._active_owners(), ["UC_recent"],
+            "DETECT_WINDOW_MAX_CATCHUP_MIN より古い投稿まで遡ってはいけない",
+        )
+
+    def test_repeated_calls_with_same_now_stay_idempotent(self):
+        # 同一 now での再呼び出し(テストで頻出するパターン)は従来どおり
+        # 固定窓へフォールバックし、同じ窓を何度見ても副作用が無いこと。
+        self._post("t1", "UC_a", "!ksk", published_at=1_000_000)
+        sync.check_ksk_commands(self.client, 1_000_060)
+        sync.check_ksk_commands(self.client, 1_000_060)
+        self.assertEqual(self._active_owners(), ["UC_a"])
+
+    def test_auto_ban_scan_count_ignores_catchup_backlog(self):
+        # 通常なら閾値未満の投稿(AUTO_BAN_THREADS_PER_SCAN未満)でも、取りこぼし
+        # 復旧でスキャン窓が広がった際にそれらが一括で候補に入ってくることがある。
+        # 自動BAN判定(1回のスキャンでの大量該当)は直近DETECT_WINDOW_MIN分だけを
+        # 見るべきで、広がった窓の全体を見て誤ってBANしてはいけない。
+        sync.check_ksk_commands(self.client, 1_000_000)  # カーソルを1_000_000に固定
+
+        n = ksk_common.AUTO_BAN_THREADS_PER_SCAN - 1
+        for i in range(n):
+            # 古い側(直近DETECT_WINDOW_MIN分の外)に分散して投稿
+            self._post(f"old{i}", "UC_a", "!ksk", published_at=1_000_010 + i)
+        # 直近5分内にも1件(こちらは正規のカウント対象)
+        far_future = 1_000_000 + 3600
+        self._post("recent", "UC_a", "!ksk", published_at=far_future - 100)
+
+        sync.check_ksk_commands(self.client, far_future)
+
+        bans = self.client.query("SELECT channel_id FROM ksk_bans")
+        self.assertEqual(bans, [], "取りこぼし復旧分を合算してBANしてはいけない")
+
+
 class KskAutoBanTest(unittest.TestCase):
     """1スキャンで大量にコマンドを打ったアカウントの自動BAN(2026-08-03追加)。"""
 

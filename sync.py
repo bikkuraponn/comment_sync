@@ -1362,24 +1362,41 @@ def _clear_time_comment_cache(time_key: str) -> None:
 # 追跡対象として登録される（オプトイン）。解除はスレ主本人が自分のスレッドへ
 # `!ksk stop` と返信する。
 #
-# YouTube API は一切叩かない — 直近 DETECT_WINDOW_MIN 分の comments を
-# idx_comments_published 経由で読むだけ。窓を毎分丸ごと再スキャンするのは、
-# YouTube側のコメント反映に数分の遅延があり得るため（check_time_comments と同じ理由）。
+# YouTube API は一切叩かない — comments を idx_comments_published 経由で読むだけ。
+# 窓は基本的に「前回スキャンし終えた地点から今回まで」(カーソル方式、
+# ksk_common.detect_window_bounds() 参照、2026-08-05変更)。以前は固定
+# DETECT_WINDOW_MIN(5)分の窓を毎分丸ごと再スキャンする設計だったが、
+# YouTube側のコメント反映遅延に加えて、GitHub Actions側の理由(1本のrunが
+# 長引くと待機中の後続runがまとめてcancelledされる)でもラグが発生し得ることが
+# 実際に確認された(2026-08-05、加速チャレンジの登録コメントが1件、固定5分窓を
+# 22秒差で外れて未検出のまま残った)。カーソル方式なら run が数分連続で
+# cancelled されても、次に成功した run が取りこぼし無く拾える。
 # 登録は thread_id の PK 冪等なので、同じ窓を何度見ても副作用はない。
 #
 # 解除コマンドは返信として打たれるため sync_new_comments() では拾えない（あちらは
 # 新規スレッドしか見ない）。この窓スキャンは親・返信を区別せず読むので、返信の
-# 解除コマンドもここで 1分以内に検知できる（追加の読み取りコストはゼロ）。
+# 解除コマンドもここで検知できる（追加の読み取りコストはゼロ）。
 # ------------------------------------------------------------------ #
 
 def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
     """直近の窓から ksk コマンドを検出して登録・解除する。戻り値は状態が変わった件数。"""
-    start_epoch, end_epoch = ksk_common.detect_window_bounds(now_epoch)
+    # main() の先頭で既に無条件ensure済みだが、この関数を単体で呼んでも安全なように
+    # ここでも呼ぶ(冪等・実質無料。test_sync.py の KskCommandRegistrationTests は
+    # main() を経由せずこの関数を直接呼ぶ)。カーソル(ksk_detect_state)を読むのに
+    # 先んじてテーブルが要るため、以前と違い関数の先頭で呼ぶ。
+    ksk_common.ensure_schema(client)
+
+    cursor = ksk_common.read_detect_cursor(client)
+    start_epoch, end_epoch = ksk_common.detect_window_bounds(now_epoch, cursor)
     rows = client.query(
         "SELECT comment_id, parent_id, author_channel_id, handle, published_at, text "
         "FROM comments WHERE published_at >= ? AND published_at < ? ORDER BY published_at",
         [start_epoch, end_epoch],
     )
+    # カーソルは(コマンドが1件も無くても)必ず前進させる。取りこぼした窓を
+    # 二度と再スキャンしないための本質はここ — write_detect_cursor() のdocstring参照。
+    ksk_common.write_detect_cursor(client, end_epoch, now_epoch)
+
     if not rows:
         return 0
 
@@ -1393,18 +1410,24 @@ def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
     if not candidates:
         return 0
 
-    # main() の先頭で既に無条件ensure済みだが、この関数を単体で呼んでも安全なように
-    # ここでも呼ぶ(冪等・実質無料。test_sync.py の KskCommandRegistrationTests は
-    # main() を経由せずこの関数を直接呼ぶ)。
-    ksk_common.ensure_schema(client)
     active = ksk_common.get_threads_by_state(client, ksk_common.STATE_ACTIVE)
     active_by_id = {t["thread_id"]: t for t in active}
     active_owners = {t["owner_channel_id"] for t in active}
     active_count = len(active)
 
-    # 登録候補はアカウントごとに1件へ絞る（同一スキャン内で複数打っていたら最新を採用）。
-    # scan_counts は絞る前の件数 = 連投の度合いなので、自動BAN判定に使う。
-    start_candidates, scan_counts = ksk_common.select_start_candidates(candidates)
+    # 登録候補は今回スキャンした窓全体（カーソルにより通常は前回からの差分、
+    # 取りこぼし復旧時は最大 DETECT_WINDOW_MAX_CATCHUP_MIN 分まで遡る）から選ぶ。
+    # アカウントごとに1件へ絞る（同一スキャン内で複数打っていたら最新を採用）。
+    start_candidates, _window_counts = ksk_common.select_start_candidates(candidates)
+
+    # 自動BAN判定(AUTO_BAN_THREADS_PER_SCAN)の件数だけは、従来どおり直近
+    # DETECT_WINDOW_MIN分の固定窓に絞って数える。取りこぼし復旧でスキャン窓が
+    # 広がった分まで含めると、通常のトーク量でも「1回のスキャンで大量該当」と
+    # 誤判定しやすくなるため（TRIGGER_BAN_THRESHOLDの10分絶対件数チェックは
+    # 元々このスキャン窓と独立に動くので、そちらは影響を受けない）。
+    recent_floor = now_epoch - ksk_common.DETECT_WINDOW_MIN * 60
+    recent_candidates = [(r, c) for r, c in candidates if int(r["published_at"]) >= recent_floor]
+    _recent_selected, scan_counts = ksk_common.select_start_candidates(recent_candidates)
 
     # 既に登録済み（active/ended どちらでも）の thread_id は上限判定をやり直さない。
     thread_ids = [r["comment_id"] for r, _c in start_candidates]

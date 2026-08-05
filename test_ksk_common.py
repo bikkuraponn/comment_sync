@@ -125,10 +125,29 @@ class ParseCommandTest(unittest.TestCase):
 
 
 class WindowTest(unittest.TestCase):
-    def test_detect_window_bounds(self):
+    def test_no_cursor_falls_back_to_fixed_window(self):
         start, end = K.detect_window_bounds(1_000_000)
         self.assertEqual(end, 1_000_000)
         self.assertEqual(end - start, K.DETECT_WINDOW_MIN * 60)
+
+    def test_cursor_at_or_after_now_falls_back_to_fixed_window(self):
+        # 同一時刻(またはそれ以降)での再呼び出しは、テストや極端に短い間隔での
+        # 呼び出しを想定した従来どおりの固定窓にフォールバックする(冪等性維持)。
+        start, end = K.detect_window_bounds(1_000_000, cursor=1_000_000)
+        self.assertEqual((start, end), (1_000_000 - K.DETECT_WINDOW_MIN * 60, 1_000_000))
+
+    def test_recent_cursor_resumes_exactly_where_it_left_off(self):
+        # 2026-08-05の修正の核: run が連続 cancelled されて前回スキャンから
+        # DETECT_WINDOW_MIN(5分)を超えて時間が空いても、カーソルの地点から
+        # 再開するので取りこぼしが起きない。
+        start, end = K.detect_window_bounds(1_000_900, cursor=1_000_000)
+        self.assertEqual((start, end), (1_000_000, 1_000_900))
+
+    def test_very_old_cursor_is_capped_at_max_catchup(self):
+        now = 1_000_000 + 3 * 3600
+        start, end = K.detect_window_bounds(now, cursor=1_000_000)
+        self.assertEqual(end, now)
+        self.assertEqual(end - start, K.DETECT_WINDOW_MAX_CATCHUP_MIN * 60)
 
 
 class EndReasonTest(unittest.TestCase):

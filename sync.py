@@ -1606,7 +1606,9 @@ def check_ksk_commands(client: TursoClient, now_epoch: int) -> int:
 def _write_ksk_index(client: TursoClient, now_epoch: int) -> None:
     """一覧ページ用の1行インデックスを作り直す(状態が変わったときだけ呼ぶ)。"""
     threads = ksk_common.get_threads_by_state(client, ksk_common.STATE_ACTIVE)
-    threads += ksk_common.get_recent_threads(client, limit=ksk_common.INDEX_PAST_LIMIT)
+    threads += ksk_common.get_recent_threads(
+        client, limit=ksk_common.INDEX_PAST_LIMIT, min_replies=ksk_common.HISTORY_MIN_REPLIES
+    )
     ksk_common.write_index(client, ksk_common.build_index_payload(threads, now_epoch), now_epoch)
 
 

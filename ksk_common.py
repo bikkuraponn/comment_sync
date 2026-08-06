@@ -110,6 +110,13 @@ TRIGGER_BAN_THRESHOLD = 12
 # (T1 の Pass1 は全 active スレッド合計で1 unit なので、放置しても実質無料)。
 MIN_REPLIES_FOR_TRACKING = 3
 
+# 履歴(過去の加速一覧、ksk_index の past 側)に残す最低返信数。この値**以下**の
+# ended スレッドは一覧から隠す(get_recent_threads の min_replies 引数)。
+# MIN_REPLIES_FOR_TRACKING と同じ「実質誰も参加しなかった」ラインを流用しているが、
+# 意味が違う概念(T2起動の可否 / 履歴に出すかどうか)なので別定数にしておく
+# (将来どちらかだけ調整したくなったときに巻き込まれないように)。
+HISTORY_MIN_REPLIES = 3
+
 # 自動終了の条件
 IDLE_TIMEOUT_SEC = 30 * 60      # 返信が増えないまま30分
 MAX_DURATION_SEC = 6 * 3600     # 開始から6時間
@@ -802,7 +809,31 @@ def get_threads_by_state(turso: TursoClient, state: str) -> list[dict]:
     )
 
 
-def get_recent_threads(turso: TursoClient, limit: int = INDEX_PAST_LIMIT) -> list[dict]:
+def get_recent_threads(
+    turso: TursoClient, limit: int = INDEX_PAST_LIMIT, min_replies: int = 0
+) -> list[dict]:
+    """直近 ended のスレッド。
+
+    min_replies>0 を渡すと `last_reply_count > min_replies` の行だけに絞る
+    (履歴一覧用、HISTORY_MIN_REPLIES 参照)。省略時(0)は今まで通り無条件。
+
+    **check_dormant_ksk_threads() はこの絞り込み無し(min_replies省略)で呼ぶこと。**
+    絞り込むと「開始直後は伸びずアイドル終了したが、後から本当に伸びた」スレッドが
+    最初から候補に入らず、DORMANT_REACTIVATE_THRESHOLD(=10件増)による復活検知が
+    永久に効かなくなる(復活判定はこの関数の返す候補に対してのみ行われるため)。
+    絞り込みは「一覧表示に出すかどうか」だけの都合であり、「後から化けるかどうか」を
+    判定する材料にはならない — 別の目的の閾値を混ぜないこと。
+
+    このクエリは idx_ksk_threads_state(state, started_at DESC) の SEARCH で、
+    min_replies による絞り込みはこの索引順の走査中に残余フィルタとして効く
+    (EXPLAIN QUERY PLAN で確認済み、追加の索引は無くても崩れない)。
+    """
+    if min_replies > 0:
+        return turso.query(
+            "SELECT * FROM ksk_threads WHERE state = ? AND last_reply_count > ? "
+            "ORDER BY started_at DESC LIMIT ?",
+            [STATE_ENDED, min_replies, limit],
+        )
     return turso.query(
         "SELECT * FROM ksk_threads WHERE state = ? ORDER BY started_at DESC LIMIT ?",
         [STATE_ENDED, limit],

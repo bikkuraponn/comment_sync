@@ -6,11 +6,15 @@
   毎分    : check_ksk_commands()       ksk(加速)スレッドの登録/解除コマンド検出(YouTube API不使用)
   1時間おき: check_dormant_ksk_threads() ended な ksk スレッドの復活検知(YouTube API不使用)
   10分おき : run_reply_recheck_batch()  コールド層(全履歴のカーソル巡回)
-  30分おき : 同上 + ホット層(直近24時間のスレッド全件)
+
+ホット層(直近24時間のスレッド全件)は2026-08-05に run_hot_recheck_batch() として
+独立ワークフロー(hot_recheck.py / .github/workflows/hot_recheck.yml)へ分離した。
+理由: バースト時のPass2がこの毎分ジョブのtimeoutを圧迫し、後続runがcancelされて
+新着同期そのものが遅延する事故を避けるため(該当節のコメント参照)。
 
 既存スレッドに後から付いた返信・スレッド/返信の削除を検知するのは
-run_reply_recheck_batch() だけ(sync_new_comments は新規スレッドしか見ない)。
-詳細はその節のコメントを参照。
+run_reply_recheck_batch()/run_hot_recheck_batch() だけ(sync_new_comments は
+新規スレッドしか見ない)。詳細はその節のコメントを参照。
 
 環境変数:
   API_KEY_FOR_ALL_COMMENT_GET, API_KEY_FOR_ALL_COMMENT_GET2, API_KEY_FOR_ALL_COMMENT_GET3
@@ -84,6 +88,12 @@ def configure_api_keys(api_keys: list[str], *, allow_rotation: bool = True) -> N
     _rate_limit_rotations = 0
     MAX_RATE_LIMIT_ROTATIONS = 2 * max(1, len(_API_KEYS))
     _allow_key_rotation = bool(allow_rotation)
+
+
+def api_keys_configured() -> bool:
+    """他のエントリポイント(hot_recheck.py等)がprivateな_API_KEYSに
+    直接触れずに設定済みか確認するための小さな公開ヘルパー。"""
+    return bool(_API_KEYS)
 
 
 def get_youtube():
@@ -526,7 +536,14 @@ def fetch_all_replies(
 # 新着同期（毎分）
 # ------------------------------------------------------------------ #
 
-MAX_PAGES = 30  # 安全弁: 毎分実行で30ページ(3000スレッド)を超える新着はあり得ない
+# 安全弁: 毎分実行でこのページ数(1ページ=100スレッド)を超える新着はあり得ない。
+# 環境変数 SYNC_MAX_PAGES で上書き可能(2026-08-05、年次バーストイベントのような突発バースト時に
+# GitHub Variables側から再デプロイ無しで即座に引き上げられるようにするため)。
+# 2025-08-10の実測ピークは1,400スレッド/分(14ページ相当)。GitHub Actionsの
+# concurrency(cancel-in-progress: false)下では1本のrunが長引くと待機中の後続run群が
+# まとめてcancelされることがあり(sync.py本体の2026-08-05の教訓)、数分ぶんの新着が
+# 1回のrunに積み上がった場合に備えてデフォルトの安全域を広げに倍にしてある。
+MAX_PAGES = int(os.getenv("SYNC_MAX_PAGES", "60"))
 
 # 安全弁(2026-07-29追加): 固定コメントは常に1件だけの想定(この動画では実際に1件)。
 # 1回の実行で2回目の「固定コメント候補」に遭遇した場合、それは本物の固定コメント変更
@@ -803,17 +820,30 @@ def _resync_thread_replies(
 # スレッドだけ _resync_thread_replies で完全再取得する
 # (comments_db の refresh_replies_local.py と同じ Pass1/Pass2 の二段構え)。
 #
-# 対象は2階建て:
+# 対象は2階建て、かつ2026-08-05から実行主体が分離されている:
 #
-#   ホット層 : 直近 HOT_WINDOW_HOURS 時間のスレッド全件、HOT_INTERVAL_MIN 分おき。
-#              下流の再計算ウィンドウ(comments_hourly=6時間、
-#              Supabase daily_stats=2日)が閉じる前に返信を Turso へ入れるための層。
-#              ここが遅れると集計から返信が恒久的に欠落する(単なる遅延では済まない)。
+#   ホット層 : 直近 HOT_WINDOW_HOURS 時間のスレッド全件。run_hot_recheck_batch() が
+#              独立ワークフロー(hot_recheck.py / .github/workflows/hot_recheck.yml)
+#              として動く。頻度はそちらのcronスケジュールが決める(この毎分ジョブ
+#              とは別プロセス・別concurrency group)。下流の再計算ウィンドウ
+#              (comments_hourly=6時間、Supabase daily_stats=2日)が閉じる前に
+#              返信を Turso へ入れるための層。ここが遅れると集計から返信が
+#              恒久的に欠落する(単なる遅延では済まない)。
 #   コールド層: published_at 昇順のカーソルで全履歴を少しずつ巡回。末尾まで
 #              行ったら先頭へ巻き戻して永久に一周し続ける
-#              (reply_recheck_state に1行だけ状態を持つ)。
+#              (reply_recheck_state に1行だけ状態を持つ)。この毎分ジョブが
+#              run_reply_recheck_batch() として RECHECK_INTERVAL_MIN おきに処理する。
 #              RECHECK_BATCH_SIZE=500 × 10分おき(1日144回)で約144万スレッドを
 #              約20日で一周する。ホット層が見ない古いスレッドの保険。
+#
+# なぜ分離したか(2026-08-05、年次バーストイベント耐性調査): 以前はこの毎分ジョブが
+# HOT_INTERVAL_MIN おきにホット層も同じプロセス内で処理していた。ホット層の
+# Pass2(食い違いスレッドの完全再取得、逐次HTTP)がバーストで数千件規模になると
+# 実行時間がGitHub Actionsの timeout-minutes: 10 に迫り、concurrency
+# (cancel-in-progress: false)下で待機中の後続の毎分run群がまとめてcancelされ、
+# 新着コメント同期(sync_new_comments、唯一代替のない経路)そのものが遅延する
+# 恐れがあった。独立ワークフロー・独立concurrency groupに分けることで、
+# ホット層がどれだけ時間を使っても毎分の新着同期には一切影響しなくなる。
 #
 # 2026-07-28 以前はこれとは別に sync_recent_replies() が直近3時間のスレッドを
 # 30分おきに「1スレッド=1 unit で全件フル再取得」していた。同じ目的(返信の
@@ -829,7 +859,6 @@ RECHECK_ID_CHUNK = 50    # commentThreads.list の id= に渡す件数(下の _M
 RECHECK_IN_CHUNK = 200   # Turso IN() 節のチャンクサイズ(ranking_updaterの_IN_CHUNKと同じ考え方)
 
 HOT_WINDOW_HOURS = 24    # ホット層が見るスレッドの範囲(comments_hourly の6時間窓に確実に間に合わせる)
-HOT_INTERVAL_MIN = 30    # ホット層を回す間隔。RECHECK_INTERVAL_MIN の倍数であること
 
 # バースト対策の安全弁(2026-07-28、年次バーストイベントのような突発的なコメント急増を想定して追加)。
 #
@@ -858,8 +887,20 @@ HOT_INTERVAL_MIN = 30    # ホット層を回す間隔。RECHECK_INTERVAL_MIN �
 #   (pass2_cap=None のまま) — 独自の TIME_BUDGET_SEC + チャンク分割で
 #   実行時間を管理しており、Pass2 を人為的に絞ると「毎月一括で確実に整合性を
 #   取る」という役割そのものが弱まってしまうため。
-HOT_BATCH_CAP = 5000
-PASS2_RUN_CAP = 500
+#
+# どちらも環境変数で上書き可能(2026-08-05、年次バーストイベント想定)。バースト規模が
+# 実測で想定と違った場合に、再デプロイ無しで GitHub Variables 側から即座に
+# 調整できるようにするため(2025-08-10実績: 1日のスレッド数38,863件に対し
+# 元のHOT_BATCH_CAP=5000は約13%しかカバーできない — 詳細はAGENTS.mdの
+# 年次バーストイベント耐性調査メモ参照)。
+HOT_BATCH_CAP = int(os.getenv("SYNC_HOT_BATCH_CAP", "5000"))
+PASS2_RUN_CAP = int(os.getenv("SYNC_PASS2_RUN_CAP", "500"))
+
+# ホット層専用のPass2上限(2026-08-05、独立ワークフロー化に伴い新設)。
+# ホット層は独自の timeout-minutes を持つ独立ワークフローで動くため、
+# 毎分ジョブ(timeout-minutes: 10)を共有するコールド層の PASS2_RUN_CAP とは
+# 別の、より大きい値を許容できる。run_hot_recheck_batch() 参照。
+HOT_PASS2_RUN_CAP = int(os.getenv("SYNC_HOT_PASS2_RUN_CAP", "2000"))
 
 # 誤削除に対する安全弁。
 #
@@ -1133,57 +1174,85 @@ def _recheck_threads(
     return written, len(dead_ids), len(mismatched), pass2_exhausted, deferred_count
 
 
-def run_reply_recheck_batch(client: TursoClient, include_hot: bool) -> int:
+def run_reply_recheck_batch(client: TursoClient) -> int:
+    """コールド層のみを処理する(毎分ジョブから RECHECK_INTERVAL_MIN おきに呼ばれる)。
+
+    2026-08-05: ホット層は run_hot_recheck_batch() として独立ワークフロー
+    (hot_recheck.py / .github/workflows/hot_recheck.yml)へ分離した。
+    以前はこの関数が引数 include_hot で両方を担い、HOT_INTERVAL_MIN おきに
+    ホット層も同じ毎分ジョブ内で処理していたが、Pass2(食い違いスレッドの
+    完全再取得、1スレッド=最低1リクエストの逐次実行)がバーストで数千件規模に
+    なると実行時間がGitHub Actionsの timeout-minutes: 10 に迫り、
+    concurrency(cancel-in-progress: false)下で待機中の後続の毎分run群が
+    まとめてcancelされ、新着コメント同期そのものが遅延する恐れがあった
+    (年次バーストイベント耐性調査、2026-08-05)。独立ワークフロー・独立concurrency groupに
+    分離することで、ホット層がどれだけ時間を使っても毎分の新着同期
+    (sync_new_comments、唯一代替のない経路)には一切影響しなくなる。
+    """
     now_epoch = int(datetime.now(timezone.utc).timestamp())
     state = _read_recheck_state(client, now_epoch)
     cold_batch, wrapped = _next_recheck_batch(client, state["cursor_published_at"])
-
-    # ホット層。コールド層のカーソルが末尾付近にいると対象が重なるので、
-    # 同じスレッドに2回 Pass1 を使わないよう重複を落とす。
-    hot_batch: list[dict] = []
-    hot_capped = False
-    if include_hot:
-        raw_hot = _hot_window_threads(client, now_epoch)
-        hot_capped = len(raw_hot) >= HOT_BATCH_CAP  # ちょうど一致=ほぼ確実に切り詰められた合図
-        cold_ids = {b["comment_id"] for b in cold_batch}
-        hot_batch = [t for t in raw_hot if t["comment_id"] not in cold_ids]
-        if hot_capped:
-            print(
-                f"  WARNING: ホット層が上限{HOT_BATCH_CAP}件に達した（バースト検知）。"
-                f"直近{HOT_WINDOW_HOURS}時間のうち新しい{HOT_BATCH_CAP}件のみ処理し、"
-                f"残りは次回以降のホット層・コールド層・月次スイープに委ねる",
-                flush=True,
-            )
-
-    batch = cold_batch + hot_batch
-    if not batch:
+    if not cold_batch:
         return 0
 
     youtube = get_youtube()
     written, dead_count, mismatch_count, aborted, deferred_pass2 = _recheck_threads(
-        client, youtube, batch, "スレッド巡回チェック", pass2_cap=PASS2_RUN_CAP,
+        client, youtube, cold_batch, "スレッド巡回チェック(コールド層)", pass2_cap=PASS2_RUN_CAP,
     )
     if aborted:
         # 状態は進めず、次回同じカーソル位置からやり直す
         return 0
 
-    # --- カーソル更新 ---
-    # ホット層は毎回同じ範囲を見直す層なのでカーソルに影響させない。
-    # 進めるのはコールド層が実際に消化した分だけ。
-    if cold_batch:
-        if wrapped:
-            state["cycle_count"] += 1
-            state["cycle_started_at"] = now_epoch
-            state["threads_checked_in_cycle"] = len(cold_batch)
-            print(f"  スレッド巡回チェック: 1周完了 → 第{state['cycle_count']}周を開始", flush=True)
-        else:
-            state["threads_checked_in_cycle"] += len(cold_batch)
-        state["cursor_published_at"] = cold_batch[-1]["published_at"]
-        _write_recheck_state(client, state, now_epoch)
+    if wrapped:
+        state["cycle_count"] += 1
+        state["cycle_started_at"] = now_epoch
+        state["threads_checked_in_cycle"] = len(cold_batch)
+        print(f"  スレッド巡回チェック(コールド層): 1周完了 → 第{state['cycle_count']}周を開始", flush=True)
+    else:
+        state["threads_checked_in_cycle"] += len(cold_batch)
+    state["cursor_published_at"] = cold_batch[-1]["published_at"]
+    _write_recheck_state(client, state, now_epoch)
 
     print(
-        f"  スレッド巡回チェック: {len(batch)}件確認"
-        f"（巡回{len(cold_batch)}件 + 直近{HOT_WINDOW_HOURS}時間{len(hot_batch)}件）、"
+        f"  スレッド巡回チェック(コールド層): {len(cold_batch)}件確認、"
+        f"食い違い{mismatch_count}件（うち先送り{deferred_pass2}件）、"
+        f"返信{written}件書込み、消滅{dead_count}件",
+        flush=True,
+    )
+    return written
+
+
+def run_hot_recheck_batch(client: TursoClient) -> int:
+    """ホット層のみを処理する(独立ワークフロー hot_recheck.py から呼ばれる。
+    頻度は .github/workflows/hot_recheck.yml の cron スケジュールで決まり、
+    コード側の定数では制御しない)。
+
+    コールド層のカーソル(reply_recheck_state)には一切触れない — ホット層は
+    毎回「直近HOT_WINDOW_HOURS時間」という同じ範囲を見直す層なので、
+    カーソルという概念自体を持たない。コールド層との対象重複(同じスレッドを
+    両方が処理すること)は許容する — 別プロセス・別ワークフローなので
+    重複排除の同期を取る意味がなく、重複コスト自体は小さい(Pass1は1 unit/50件、
+    Pass2はUPSERTが冪等なので二重に書いても実害はない)。
+    """
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    hot_batch = _hot_window_threads(client, now_epoch)
+    if len(hot_batch) >= HOT_BATCH_CAP:  # ちょうど一致=ほぼ確実に切り詰められた合図
+        print(
+            f"  WARNING: ホット層が上限{HOT_BATCH_CAP}件に達した（バースト検知）。"
+            f"直近{HOT_WINDOW_HOURS}時間のうち新しい{HOT_BATCH_CAP}件のみ処理し、"
+            f"残りは次回以降のホット層・コールド層・月次スイープに委ねる",
+            flush=True,
+        )
+    if not hot_batch:
+        return 0
+
+    youtube = get_youtube()
+    written, dead_count, mismatch_count, _aborted, deferred_pass2 = _recheck_threads(
+        client, youtube, hot_batch, "スレッド巡回チェック(ホット層)", pass2_cap=HOT_PASS2_RUN_CAP,
+    )
+
+    print(
+        f"  スレッド巡回チェック(ホット層): 直近{HOT_WINDOW_HOURS}時間{len(hot_batch)}件確認、"
         f"食い違い{mismatch_count}件（うち先送り{deferred_pass2}件）、"
         f"返信{written}件書込み、消滅{dead_count}件",
         flush=True,
@@ -1927,12 +1996,12 @@ def main():
         except Exception as e:
             print(f"  ksk休眠チェックエラー: {e}", flush=True)
 
-    # 10分おき: コールド層(全履歴のカーソル巡回)だけ
-    # 30分おき: それに加えてホット層(直近24時間のスレッド全件)も見る
+    # 10分おき: コールド層(全履歴のカーソル巡回)だけ。
+    # ホット層(直近24時間のスレッド全件)は2026-08-05に独立ワークフロー
+    # (hot_recheck.py / .github/workflows/hot_recheck.yml)へ分離済み。
+    # 頻度はそちらのcronスケジュールが決める(このプロセスの毎分ジョブとは無関係)。
     if now.minute % RECHECK_INTERVAL_MIN == 0:
-        n_recheck = run_reply_recheck_batch(
-            client, include_hot=(now.minute % HOT_INTERVAL_MIN == 0),
-        )
+        n_recheck = run_reply_recheck_batch(client)
         print(f"  スレッド巡回チェック書込み: {n_recheck} 件")
 
     # 毎分: 現在時間のバケットだけ再計算（軽い）

@@ -1,0 +1,51 @@
+name: Hot Recheck
+
+# 2026-08-05: sync.py の毎分ジョブから分離したホット層(直近24時間のスレッド全件)
+# 専用ワークフロー。頻度は毎分実行を要さない(30〜60分間隔で十分)ため、
+# 他の日次/週次/月次ジョブ(analytics_aggregates_updater等)と同じく
+# GitHub Actions のネイティブ schedule を使う — cron-job.org 経由の
+# repository_dispatch は「正確な毎分実行」を保証するために導入したもので、
+# この頻度では必要ない。
+on:
+  schedule:
+    - cron: "0 * * * *"  # 毎時0分(JSTでも毎時0分。UTC/JSTのズレは時刻そのものに影響しない)
+  workflow_dispatch: {}
+
+concurrency:
+  group: hot-recheck
+  cancel-in-progress: false
+
+jobs:
+  hot_recheck:
+    runs-on: ubuntu-latest
+    # コールド層を含む毎分ジョブ(timeout-minutes: 10)とは別枠。
+    # Pass2(食い違いスレッドの完全再取得、逐次HTTP)がバーストで数千件規模に
+    # なることを見込んで余裕を持たせる。
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run hot recheck
+        env:
+          API_KEY_FOR_ALL_COMMENT_GET:  ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET }}
+          API_KEY_FOR_ALL_COMMENT_GET2: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET2 }}
+          API_KEY_FOR_ALL_COMMENT_GET3: ${{ secrets.API_KEY_FOR_ALL_COMMENT_GET3 }}
+          VIDEO_ID:         ${{ vars.VIDEO_ID }}
+          TURSO_URL:        ${{ secrets.TURSO_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          # バースト用安全弁(2026-08-05、年次バーストイベント想定)。再デプロイ無しで
+          # GitHub Variables 側から値を変えられるのが目的。
+          # デフォルトは5000×30分の旧設定より広い25000×60分相当
+          # (2025-08-10実績: 1日のスレッド数38,863件に対し旧5000は約13%しか
+          # カバーできなかったため — 詳細はAGENTS.mdの年次バーストイベント耐性調査メモ参照)。
+          SYNC_HOT_BATCH_CAP:     ${{ vars.SYNC_HOT_BATCH_CAP || '25000' }}
+          SYNC_HOT_PASS2_RUN_CAP: ${{ vars.SYNC_HOT_PASS2_RUN_CAP || '2000' }}
+        run: python hot_recheck.py

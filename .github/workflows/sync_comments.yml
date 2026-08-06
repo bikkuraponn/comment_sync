@@ -46,4 +46,11 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           FLASK_BASE_URL:   ${{ vars.FLASK_BASE_URL }}
           API_TOKEN:        ${{ secrets.API_TOKEN }}
+          # バースト用安全弁(2026-08-05、年次バーストイベント想定)。GitHub Variablesが未設定でも
+          # `|| 'default'` でコード側のデフォルト値と同じ値にフォールバックする。
+          # 再デプロイ無しで Variables 側から値を変えられるのが目的。
+          # ホット層(SYNC_HOT_BATCH_CAP/SYNC_HOT_INTERVAL_MIN)は独立ワークフロー
+          # hot_recheck.yml に移ったため、この毎分ジョブでは渡さない。
+          SYNC_MAX_PAGES:     ${{ vars.SYNC_MAX_PAGES || '60' }}
+          SYNC_PASS2_RUN_CAP: ${{ vars.SYNC_PASS2_RUN_CAP || '500' }}
         run: python sync.py

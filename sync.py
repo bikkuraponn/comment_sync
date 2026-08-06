@@ -46,7 +46,7 @@ import account_live_core
 import repair_queue
 from turso_client import TursoClient
 
-VIDEO_ID = os.getenv("VIDEO_ID", "[REDACTED_VIDEO_ID]")
+VIDEO_ID = os.getenv("VIDEO_ID")
 BATCH_SIZE = 300
 JST = ZoneInfo("Asia/Tokyo")
 

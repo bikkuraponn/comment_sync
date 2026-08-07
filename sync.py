@@ -537,7 +537,7 @@ def fetch_all_replies(
 # ------------------------------------------------------------------ #
 
 # 安全弁: 毎分実行でこのページ数(1ページ=100スレッド)を超える新着はあり得ない。
-# 環境変数 SYNC_MAX_PAGES で上書き可能(2026-08-05、年次バーストイベントのような突発バースト時に
+# 環境変数 SYNC_MAX_PAGES で上書き可能(2026-08-05、年に一度の突発バースト時に
 # GitHub Variables側から再デプロイ無しで即座に引き上げられるようにするため)。
 # 2025-08-10の実測ピークは1,400スレッド/分(14ページ相当)。GitHub Actionsの
 # concurrency(cancel-in-progress: false)下では1本のrunが長引くと待機中の後続run群が
@@ -836,7 +836,7 @@ def _resync_thread_replies(
 #              RECHECK_BATCH_SIZE=500 × 10分おき(1日144回)で約144万スレッドを
 #              約20日で一周する。ホット層が見ない古いスレッドの保険。
 #
-# なぜ分離したか(2026-08-05、年次バーストイベント耐性調査): 以前はこの毎分ジョブが
+# なぜ分離したか(2026-08-05、年次バースト耐性調査): 以前はこの毎分ジョブが
 # HOT_INTERVAL_MIN おきにホット層も同じプロセス内で処理していた。ホット層の
 # Pass2(食い違いスレッドの完全再取得、逐次HTTP)がバーストで数千件規模になると
 # 実行時間がGitHub Actionsの timeout-minutes: 10 に迫り、concurrency
@@ -860,7 +860,7 @@ RECHECK_IN_CHUNK = 200   # Turso IN() 節のチャンクサイズ(ranking_update
 
 HOT_WINDOW_HOURS = 24    # ホット層が見るスレッドの範囲(comments_hourly の6時間窓に確実に間に合わせる)
 
-# バースト対策の安全弁(2026-07-28、年次バーストイベントのような突発的なコメント急増を想定して追加)。
+# バースト対策の安全弁(2026-07-28、年に一度の突発的なコメント急増を想定して追加)。
 #
 # ホット層は「直近24時間の全スレッド」を無条件で毎回 Pass1 にかける設計だったため、
 # その24時間にコメント数が急増すると Pass1 の units・Pass2 の実行時間が
@@ -892,7 +892,7 @@ HOT_WINDOW_HOURS = 24    # ホット層が見るスレッドの範囲(comments_h
 # 実測で想定と違った場合に、再デプロイ無しで GitHub Variables 側から即座に
 # 調整できるようにするため(2025-08-10実績: 1日のスレッド数38,863件に対し
 # 元のHOT_BATCH_CAP=5000は約13%しかカバーできない — 詳細はAGENTS.mdの
-# 年次バーストイベント耐性調査メモ参照)。
+# 年次バースト耐性調査メモ参照)。
 HOT_BATCH_CAP = int(os.getenv("SYNC_HOT_BATCH_CAP", "5000"))
 PASS2_RUN_CAP = int(os.getenv("SYNC_PASS2_RUN_CAP", "500"))
 
@@ -1185,7 +1185,7 @@ def run_reply_recheck_batch(client: TursoClient) -> int:
     なると実行時間がGitHub Actionsの timeout-minutes: 10 に迫り、
     concurrency(cancel-in-progress: false)下で待機中の後続の毎分run群が
     まとめてcancelされ、新着コメント同期そのものが遅延する恐れがあった
-    (年次バーストイベント耐性調査、2026-08-05)。独立ワークフロー・独立concurrency groupに
+    (年次バースト耐性調査、2026-08-05)。独立ワークフロー・独立concurrency groupに
     分離することで、ホット層がどれだけ時間を使っても毎分の新着同期
     (sync_new_comments、唯一代替のない経路)には一切影響しなくなる。
     """

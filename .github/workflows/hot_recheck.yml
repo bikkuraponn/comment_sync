@@ -62,7 +62,7 @@ jobs:
           # GitHub Variables 側から値を変えられるのが目的。
           # デフォルトは5000×30分の旧設定より広い25000×60分相当
           # (2025-08-10実績: 1日のスレッド数38,863件に対し旧5000は約13%しか
-          # カバーできなかったため — 詳細はAGENTS.mdの年次バーストイベント耐性調査メモ参照)。
+          # カバーできなかったため — 詳細はAGENTS.mdの年次バースト耐性調査メモ参照)。
           SYNC_HOT_BATCH_CAP:     ${{ vars.SYNC_HOT_BATCH_CAP || '25000' }}
           SYNC_HOT_PASS2_RUN_CAP: ${{ vars.SYNC_HOT_PASS2_RUN_CAP || '2000' }}
         run: python hot_recheck.py

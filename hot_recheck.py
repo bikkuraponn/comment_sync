@@ -10,7 +10,7 @@ GitHub Actions .github/workflows/hot_recheck.yml から独自の cron スケジ�
 毎分ジョブ(timeout-minutes: 10)内で処理していたため、Pass2 が長引くと
 GitHub Actions の concurrency(cancel-in-progress: false)下で待機中の後続の
 毎分run群がまとめてcancelされ、新着コメント同期(sync_new_comments、唯一
-代替のない経路)そのものが遅延する恐れがあった(年次バーストイベント耐性調査、2026-08-05)。
+代替のない経路)そのものが遅延する恐れがあった(年次バースト耐性調査、2026-08-05)。
 独立ワークフロー・独立concurrency groupに分けることで、ホット層がどれだけ
 時間を使っても毎分の新着同期には一切影響しなくなる。
 

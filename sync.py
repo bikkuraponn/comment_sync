@@ -807,6 +807,58 @@ def _resync_thread_replies(
     return youtube, len(pending), deleted, False
 
 
+def _apply_inline_replies(
+    client: TursoClient, tid: str, thread_pub: int, inline_replies: list,
+    now_epoch: int, sightings: dict,
+) -> tuple[int, int]:
+    """totalReplyCount <= INLINE_REPLIES_LIMIT のスレッド用、Pass2を使わない版。
+
+    Pass1(commentThreads.list)のレスポンスに既に全返信が inline で含まれて
+    いるため、追加のAPI呼び出し(comments.list)を一切行わない。ロジックは
+    _resync_thread_replies と同じ(全件UPSERT + 既知IDとの差分で削除検知)
+    だが、データの取得元がAPIではなく引数で渡された inline_replies である点だけ
+    が違う。is_deleted_sentinel のチェックは sync_new_comments() の inline
+    replies 処理に合わせた(削除済みコメントがセンチネル形式で inline に
+    含まれるケースへの対応 — comments.list(parentId=) 側はそもそも削除済みを
+    返さない前提のため _resync_thread_replies には無い)。
+
+    戻り値: (書き込んだ返信件数, 削除検知した件数)
+    """
+    pending: list[dict] = []
+    fetched_ids: set[str] = set()
+    for order, r in enumerate(inline_replies, 1):
+        rs = r["snippet"]
+        r_del = is_deleted_sentinel(rs)
+        fetched_ids.add(r["id"])
+        _note_author(sightings, rs, now_epoch)
+        pending.append({
+            "comment_id": r["id"],
+            "parent_id": tid,
+            "reply_order": order,
+            "thread_published_at": thread_pub,
+            "author_channel_id": rs.get("authorChannelId", {}).get("value"),
+            "handle": rs.get("authorDisplayName") if not r_del else None,
+            "text": rs.get("textDisplay") if not r_del else None,
+            "original_text": None,
+            "published_at": parse_epoch(rs["publishedAt"]),
+            "like_count": None if r_del else int(rs.get("likeCount", 0)),
+            "is_pinned": 0,
+            "is_deleted": 1 if r_del else 0,
+            "deleted_confirmed_at": now_epoch if r_del else None,
+            "fetched_at": now_epoch,
+        })
+
+    upsert_rows(client, pending)
+
+    known = client.query(
+        "SELECT comment_id FROM comments WHERE parent_id = ? AND is_deleted = 0",
+        [tid],
+    )
+    known_ids = {row["comment_id"] for row in known}
+    deleted = _mark_deleted(client, list(known_ids - fetched_ids), now_epoch)
+    return len(pending), deleted
+
+
 # ------------------------------------------------------------------ #
 # スレッド巡回チェック（Pass 1 = 安い探索、毎10分）
 #
@@ -1007,11 +1059,30 @@ def _hot_window_threads(client: TursoClient, now_epoch: int) -> list[dict]:
     )
 
 
+# commentThreads.list の part=replies が返す inline 返信の上限件数(実測確認済み、
+# 2026-08-06)。totalReplyCount がこの件数以下のスレッドは inline_replies に
+# 全件が含まれる(実測: inline件数 == totalReplyCount)。これを超えるスレッドは
+# 5件で頭打ちになり不完全(実測: totalReplyCount=7/29/104/652 のいずれも
+# inline件数は5)。inline replies の並び順は comments.list(parentId=)(Pass2が
+# 使う取得方法)と同じ古い順(投稿順)であることも実測確認済みなので、
+# reply_order の採番はPass2と同じロジックをそのまま使ってよい。
+INLINE_REPLIES_LIMIT = 5
+
+
 def _pass1_reply_counts(youtube, thread_ids: list[str]):
-    """Pass 1: commentThreads.list(id=) でまとめて生存確認と totalReplyCount を取る。
+    """Pass 1: commentThreads.list(id=) でまとめて生存確認と totalReplyCount、
+    および inline 返信(最大 INLINE_REPLIES_LIMIT 件)を取る。
 
     戻り値: (次に使う youtube クライアント, 生存スレッドID, {スレッドID: totalReplyCount},
-             クォータ枯渇, 切り詰め検知)
+             {スレッドID: inline返信リスト}, クォータ枯渇, 切り詰め検知)
+
+    2026-08-06: part に replies を追加した(以前は snippet のみ)。
+    totalReplyCount <= INLINE_REPLIES_LIMIT のスレッドはこの inline 返信だけで
+    完結するため、_recheck_threads 側で Pass2(comments.list、1スレッド=最低
+    1リクエストの逐次実行)を丸ごとスキップできる。sync_new_comments() の
+    fetch_all_replies() が「inline返信で totalReplyCount に達していれば追加取得
+    しない」という同じ発想を既に使っており、その考え方を巡回チェックのPass1にも
+    適用した形。part追加によるunitsコストの増加は無い(1リクエスト=1 unitのまま)。
 
     youtube を返り値に含めるのは、内部でキーローテーションが起きた場合に
     呼び出し側(_recheck_threads)がその後の Pass2 で使う youtube を確実に
@@ -1027,6 +1098,7 @@ def _pass1_reply_counts(youtube, thread_ids: list[str]):
     """
     alive_ids: set[str] = set()
     reply_counts: dict[str, int] = {}
+    inline_replies_map: dict[str, list] = {}
     rate_limit_retries = 0
 
     for i in range(0, len(thread_ids), RECHECK_ID_CHUNK):
@@ -1034,7 +1106,7 @@ def _pass1_reply_counts(youtube, thread_ids: list[str]):
         while True:
             try:
                 resp = youtube.commentThreads().list(
-                    part="snippet",
+                    part="snippet,replies",
                     id=",".join(chunk),
                     textFormat="plainText",
                     maxResults=50,
@@ -1047,7 +1119,7 @@ def _pass1_reply_counts(youtube, thread_ids: list[str]):
                 if should_raise:
                     raise
                 if exhausted:
-                    return youtube, alive_ids, reply_counts, True, False
+                    return youtube, alive_ids, reply_counts, inline_replies_map, True, False
                 continue
 
         if resp.get("nextPageToken"):
@@ -1056,14 +1128,15 @@ def _pass1_reply_counts(youtube, thread_ids: list[str]):
                 f"削除の誤検知を避けるため中断する。RECHECK_ID_CHUNK を見直すこと",
                 flush=True,
             )
-            return youtube, alive_ids, reply_counts, False, True
+            return youtube, alive_ids, reply_counts, inline_replies_map, False, True
 
         for item in resp.get("items", []):
             tid = item["id"]
             alive_ids.add(tid)
             reply_counts[tid] = item["snippet"].get("totalReplyCount", 0)
+            inline_replies_map[tid] = item.get("replies", {}).get("comments", [])
 
-    return youtube, alive_ids, reply_counts, False, False
+    return youtube, alive_ids, reply_counts, inline_replies_map, False, False
 
 
 def _known_reply_counts(client: TursoClient, thread_ids: list[str]) -> dict[str, int]:
@@ -1105,7 +1178,9 @@ def _recheck_threads(
     checked_ids = [t["comment_id"] for t in threads]
 
     # --- Pass 1: 安い探索 ---
-    youtube, alive_ids, reply_counts, quota_exhausted, truncated = _pass1_reply_counts(youtube, checked_ids)
+    youtube, alive_ids, reply_counts, inline_replies_map, quota_exhausted, truncated = (
+        _pass1_reply_counts(youtube, checked_ids)
+    )
     if quota_exhausted:
         print(f"  {label}をスキップ（クォータ枯渇）", flush=True)
         return 0, 0, 0, True, 0
@@ -1142,22 +1217,43 @@ def _recheck_threads(
         if reply_counts.get(tid, 0) != known_counts.get(tid, 0)
     ]
 
+    # 2026-08-06: totalReplyCount <= INLINE_REPLIES_LIMIT のスレッドは、
+    # Pass1で既に取得済みの inline_replies だけで完結できる(追加のAPI呼び出し
+    # 不要)。API呼び出しを伴わないためpass2_capの対象から外し、全件その場で
+    # 処理する。実際にPass2(comments.list、1スレッド=最低1リクエストの逐次実行)
+    # が必要なのは inline_replies だけでは不完全な(totalReplyCount超過)分だけ。
+    inline_complete = [
+        tid for tid in mismatched if reply_counts.get(tid, 0) <= INLINE_REPLIES_LIMIT
+    ]
+    needs_pass2 = [
+        tid for tid in mismatched if reply_counts.get(tid, 0) > INLINE_REPLIES_LIMIT
+    ]
+
     deferred_count = 0
-    to_resync = mismatched
-    if pass2_cap is not None and len(mismatched) > pass2_cap:
+    to_resync = needs_pass2
+    if pass2_cap is not None and len(needs_pass2) > pass2_cap:
         # 新しい順に優先して実行時間を有界にする。溢れた分は次回の Pass1 で
         # 再検知される(書き込まれていないので食い違いが残ったまま)。
-        mismatched.sort(key=lambda tid: thread_pub_map[tid], reverse=True)
-        to_resync = mismatched[:pass2_cap]
-        deferred_count = len(mismatched) - pass2_cap
+        needs_pass2.sort(key=lambda tid: thread_pub_map[tid], reverse=True)
+        to_resync = needs_pass2[:pass2_cap]
+        deferred_count = len(needs_pass2) - pass2_cap
         print(
-            f"  WARNING: {label}: 食い違い{len(mismatched)}件が上限{pass2_cap}件を超過。"
+            f"  WARNING: {label}: Pass2必要{len(needs_pass2)}件が上限{pass2_cap}件を超過。"
             f"新しい{pass2_cap}件だけ Pass2 を実行し、残り{deferred_count}件は次回に先送りする",
             flush=True,
         )
 
     sightings: dict = {}
     written = 0
+
+    # inline_repliesだけで完結する分を先に処理する(API呼び出し無し)。
+    for tid in inline_complete:
+        n, _deleted = _apply_inline_replies(
+            client, tid, thread_pub_map[tid], inline_replies_map.get(tid, []),
+            now_epoch, sightings,
+        )
+        written += n
+
     pass2_exhausted = False
     for tid in to_resync:
         # 更新後の youtube を必ず受け取り、次のスレッドへ引き継ぐ(2026-07-29修正。

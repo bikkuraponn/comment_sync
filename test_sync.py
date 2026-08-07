@@ -31,6 +31,23 @@ def epoch_to_iso(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def make_reply(rid: str, published_epoch: int, author="UC_reply", handle="@replier",
+               text="reply text", deleted=False) -> dict:
+    """commentThreads.list(part=replies)のinline返信、またはcomments.list()の
+    返信1件ぶんのAPIレスポンス形式(topLevelCommentではなく直接{id, snippet})。"""
+    return {
+        "id": rid,
+        "snippet": {
+            "publishedAt": epoch_to_iso(published_epoch),
+            # is_deleted_sentinel()はauthorDisplayName==""をセンチネル扱いする
+            "authorDisplayName": "" if deleted else handle,
+            "likeCount": 0,
+            "authorChannelId": {"value": author},
+            "textDisplay": text,
+        },
+    }
+
+
 def make_item(tid: str, published_epoch: int, reply_count: int = 0, replies=None) -> dict:
     return {
         "snippet": {
@@ -84,6 +101,12 @@ class SqliteTurso:
 
     def execute(self, sql, args=None, timeout=30):
         self.db.execute(sql, args or [])
+        self.db.commit()
+        return {}
+
+    def batch(self, statements, timeout=30):
+        for stmt in statements:
+            self.db.execute(stmt["sql"], stmt.get("args") or [])
         self.db.commit()
         return {}
 
@@ -340,7 +363,10 @@ class KeyRotationPropagationTests(unittest.TestCase):
         client = FakeTurso()
         with patch.object(
             sync, "_pass1_reply_counts",
-            return_value=(after_pass1_youtube, {"t1", "t2"}, {"t1": 5, "t2": 5}, False, False),
+            # reply_countsはINLINE_REPLIES_LIMIT(5)超過にしてPass2経路を通す
+            # (5以下だと_apply_inline_repliesに回りPass2が呼ばれなくなる)。
+            return_value=(after_pass1_youtube, {"t1", "t2"}, {"t1": 10, "t2": 10},
+                           {"t1": [], "t2": []}, False, False),
         ), patch.object(
             sync, "_known_reply_counts", return_value={"t1": 3, "t2": 3},
         ), patch.object(
@@ -359,7 +385,8 @@ class KeyRotationPropagationTests(unittest.TestCase):
         client = FakeTurso()
         with patch.object(
             sync, "_pass1_reply_counts",
-            return_value=(object(), {"t1"}, {"t1": 5}, False, False),
+            # INLINE_REPLIES_LIMIT(5)超過にしてPass2経路を通す
+            return_value=(object(), {"t1"}, {"t1": 10}, {"t1": []}, False, False),
         ), patch.object(
             sync, "_known_reply_counts", return_value={"t1": 0},
         ), patch.object(
@@ -371,6 +398,141 @@ class KeyRotationPropagationTests(unittest.TestCase):
             )
 
         self.assertTrue(aborted)
+
+
+class InlineRepliesOptimizationTests(unittest.TestCase):
+    """2026-08-06: commentThreads.list(part=replies)のinline返信で
+    totalReplyCount <= INLINE_REPLIES_LIMIT のスレッドが完結し、Pass2
+    (comments.list、1スレッド=最低1リクエスト)を丸ごとスキップできることの検証。"""
+
+    COMMENTS_SCHEMA = (
+        "CREATE TABLE comments ("
+        " comment_id TEXT PRIMARY KEY, parent_id TEXT, reply_order INTEGER,"
+        " thread_published_at INTEGER, author_channel_id TEXT, handle TEXT,"
+        " text TEXT, original_text TEXT, published_at INTEGER, like_count INTEGER,"
+        " is_pinned INTEGER, is_deleted INTEGER, deleted_confirmed_at INTEGER,"
+        " fetched_at INTEGER)"
+    )
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(self.COMMENTS_SCHEMA)
+
+    def test_apply_inline_replies_upserts_all_replies_in_order(self):
+        replies = [
+            make_reply("r1", 1000, handle="@a", text="first"),
+            make_reply("r2", 1010, handle="@b", text="second"),
+        ]
+        written, deleted = sync._apply_inline_replies(
+            self.client, "thread1", 900, replies, now_epoch=2000, sightings={},
+        )
+
+        self.assertEqual(written, 2)
+        self.assertEqual(deleted, 0)
+        rows = self.client.query(
+            "SELECT comment_id, reply_order, handle, text, is_deleted FROM comments "
+            "ORDER BY reply_order"
+        )
+        self.assertEqual(
+            [(r["comment_id"], r["reply_order"], r["handle"], r["text"], r["is_deleted"])
+             for r in rows],
+            [("r1", 1, "@a", "first", 0), ("r2", 2, "@b", "second", 0)],
+        )
+
+    def test_apply_inline_replies_marks_vanished_replies_as_deleted(self):
+        # 前回の巡回チェックで既知の返信が3件(r1,r2,r3)あった状態を再現する。
+        for i, rid in enumerate(["r1", "r2", "r3"], 1):
+            self.client.execute(
+                "INSERT INTO comments(comment_id,parent_id,reply_order,is_deleted,fetched_at) "
+                "VALUES(?,?,?,0,1000)",
+                [rid, "thread1", i],
+            )
+
+        # 今回のinline返信にはr2が含まれない(=削除された想定)。
+        replies = [make_reply("r1", 1000), make_reply("r3", 1020)]
+        written, deleted = sync._apply_inline_replies(
+            self.client, "thread1", 900, replies, now_epoch=2000, sightings={},
+        )
+
+        self.assertEqual(written, 2)
+        self.assertEqual(deleted, 1)
+        rows = {r["comment_id"]: r["is_deleted"] for r in self.client.query(
+            "SELECT comment_id, is_deleted FROM comments"
+        )}
+        self.assertEqual(rows, {"r1": 0, "r2": 1, "r3": 0})
+
+    def test_apply_inline_replies_respects_deleted_sentinel(self):
+        replies = [make_reply("r1", 1000, deleted=True)]
+        sync._apply_inline_replies(
+            self.client, "thread1", 900, replies, now_epoch=2000, sightings={},
+        )
+        row = self.client.query(
+            "SELECT is_deleted, handle, text FROM comments WHERE comment_id = 'r1'"
+        )[0]
+        self.assertEqual(row["is_deleted"], 1)
+        self.assertIsNone(row["handle"])
+        self.assertIsNone(row["text"])
+
+    def test_recheck_threads_skips_pass2_when_reply_count_within_inline_limit(self):
+        """totalReplyCount <= INLINE_REPLIES_LIMIT のスレッドは_resync_thread_replies
+        (Pass2)を一切呼ばず、inline_repliesだけで完結すること。"""
+        threads = [{"comment_id": "t1", "published_at": 100}]
+        inline = [make_reply("r1", 200), make_reply("r2", 210)]
+
+        pass2_calls = []
+
+        def fake_resync(youtube, client, tid, thread_pub, now_epoch, sightings):
+            pass2_calls.append(tid)
+            return youtube, 0, 0, False
+
+        with patch.object(
+            sync, "_pass1_reply_counts",
+            # totalReplyCount=2 <= INLINE_REPLIES_LIMIT(5)
+            return_value=(object(), {"t1"}, {"t1": 2}, {"t1": inline}, False, False),
+        ), patch.object(
+            sync, "_known_reply_counts", return_value={"t1": 0},
+        ), patch.object(
+            sync, "_resync_thread_replies", side_effect=fake_resync,
+        ):
+            written, _dead, mismatch, aborted, _deferred = sync._recheck_threads(
+                self.client, object(), threads, "test", pass2_cap=None,
+            )
+
+        self.assertEqual(pass2_calls, [], "5件以下のスレッドでPass2を呼んではいけない")
+        self.assertEqual(written, 2)
+        self.assertEqual(mismatch, 1)
+        self.assertFalse(aborted)
+        rows = self.client.query("SELECT comment_id FROM comments ORDER BY comment_id")
+        self.assertEqual([r["comment_id"] for r in rows], ["r1", "r2"])
+
+    def test_recheck_threads_still_uses_pass2_when_reply_count_exceeds_inline_limit(self):
+        """totalReplyCount > INLINE_REPLIES_LIMIT のスレッドは従来どおりPass2に回すこと。"""
+        threads = [{"comment_id": "t1", "published_at": 100}]
+        pass2_calls = []
+
+        def fake_resync(youtube, client, tid, thread_pub, now_epoch, sightings):
+            pass2_calls.append(tid)
+            return youtube, 3, 0, False
+
+        with patch.object(
+            sync, "_pass1_reply_counts",
+            # totalReplyCount=6 > INLINE_REPLIES_LIMIT(5)、inlineは5件で頭打ち(不完全)
+            return_value=(object(), {"t1"}, {"t1": 6}, {"t1": [make_reply(f"r{i}", i) for i in range(5)]},
+                           False, False),
+        ), patch.object(
+            sync, "_known_reply_counts", return_value={"t1": 2},
+        ), patch.object(
+            sync, "_resync_thread_replies", side_effect=fake_resync,
+        ):
+            written, _dead, mismatch, aborted, _deferred = sync._recheck_threads(
+                self.client, object(), threads, "test", pass2_cap=None,
+            )
+
+        self.assertEqual(pass2_calls, ["t1"], "6件以上のスレッドはPass2で完全再取得すべき")
+        self.assertEqual(written, 3)
+        self.assertEqual(mismatch, 1)
+        self.assertFalse(aborted)
 
 
 class KskCommandRegistrationTests(unittest.TestCase):

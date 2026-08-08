@@ -43,9 +43,10 @@ jobs:
       - name: Verify secret
         if: github.event_name == 'repository_dispatch'
         env:
+          RECEIVED_CRONJOB_SECRET: ${{ github.event.client_payload.secret }}
           CRONJOB_SECRET: ${{ secrets.CRONJOB_SECRET }}
         run: |
-          if [[ "${{ github.event.client_payload.secret }}" != "$CRONJOB_SECRET" ]]; then
+          if [[ "$RECEIVED_CRONJOB_SECRET" != "$CRONJOB_SECRET" ]]; then
             echo "Invalid secret"
             exit 1
           fi
